@@ -16,7 +16,7 @@ Application de streaming d'écran optimisée pour Windows vers Raspberry Pi (ou 
 ### Sur le PC (Windows)
 1. Téléchargez le dossier complet.
 2. Lancez **`start.bat`**.
-   - Ce script installera automatiquement les dépendances Python nécessaires (`requirements.txt`) et lancera l'interface.
+   - Ce script lancera l'interface.
 
 ### Sur le Raspberry Pi (Récepteur)
 1. Assurez-vous d'avoir Python 3 installé.
@@ -58,3 +58,10 @@ L'application diffuse le flux vidéo de votre écran via votre **réseau local**
 - `stream_receiver.py` : Script à exécuter sur le client (Raspberry Pi).
 - `stream_config.json` : Fichier de configuration (généré automatiquement, **ne pas partager**).
 - `start.bat` : Lanceur automatique.
+
+## 📄 Licence
+
+Open source sous licence **AGPL-3.0** pour usage personnel et non commercial.
+
+Pour toute utilisation commerciale merci de me contacter.
+📧 Mail : contact.creaprisme@gmail.com
