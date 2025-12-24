@@ -1,0 +1,24 @@
+=== MSS MONITORS ===
+MSS Index 0: {'left': 0, 'top': 0, 'width': 5206, 'height': 1080}
+MSS Index 1: {'left': 0, 'top': 0, 'width': 1920, 'height': 1080}
+MSS Index 2: {'left': 3840, 'top': 0, 'width': 1366, 'height': 768}
+MSS Index 3: {'left': 1920, 'top': 0, 'width': 1920, 'height': 1080}
+
+=== DXCAM MONITORS ===
+--- Checking DXCam Index 0 ---
+DXCam Index 0 Created.
+  Width: 1920
+  Height: 1080
+DXCam Index 0: Error ('DXCamera' object has no attribute 'rotation')
+--- Checking DXCam Index 1 ---
+DXCam Index 1 Created.
+  Width: 1920
+  Height: 1080
+DXCam Index 1: Error ('DXCamera' object has no attribute 'rotation')
+--- Checking DXCam Index 2 ---
+DXCam Index 2 Created.
+  Width: 1366
+  Height: 768
+DXCam Index 2: Error ('DXCamera' object has no attribute 'rotation')
+--- Checking DXCam Index 3 ---
+DXCam Index 3: Stopped (list index out of range)
