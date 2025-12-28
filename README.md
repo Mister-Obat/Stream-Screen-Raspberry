@@ -16,6 +16,11 @@
 
 Contrairement aux solutions classiques (VNC, MJPEG), Stream Screen exploite l'accélération matérielle **NVENC/AMF** de votre carte graphique et le protocole **UDP** pour garantir une expérience sans-fil proche du câble HDMI.
 
+### Écran Virtuel (Optionnel)
+
+Pour créer un véritable second moniteur sans matériel supplémentaire, je recommande l'excellent [**Virtual Display Driver**](https://github.com/VirtualDrivers/Virtual-Display-Driver).
+Il permet d'ajouter un écran virtuel à votre PC, idéal pour étendre votre bureau vers le Raspberry Pi.
+
 ## Fonctionnalités Clés
 
 *   **Architecture "Zero-Copy"** : Capture DXCam directe vers Encodeur GPU.
@@ -92,6 +97,6 @@ python3 stream_receiver.py
 ### Auteurs & Licence
 
 **Mister Obat** — Conception & Développement
-*Avec l'assistance technique de l'IA Google DeepMind.*
+*Avec l'assistance technique de l'IA.*
 
 Licence **AGPL-3.0**. Usage personnel libre.
