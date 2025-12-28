@@ -8,6 +8,9 @@ import threading
 import json
 import collections
 
+import av
+import numpy as np
+
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 import pygame
 
@@ -26,8 +29,8 @@ DEFAULT_PORT = 5555
 UDP_PORT = 5555
 
 # Global State
-latest_frame = None
-latest_frame_seq = 0
+# Global State
+latest_frame = None # (bytes, w, h)
 frame_lock = threading.Lock()
 running = True
 
@@ -61,9 +64,11 @@ def send_command(sock, cmd_dict):
     except: pass
 
 def network_thread_func(sock):
-    global latest_frame, latest_frame_seq, running
+    global latest_frame, running
     
-    print("[NET] Thread démarré (Mode FAST/OUT-OF-ORDER).")
+    print("[NET] Thread démarré (H.264 Decoder).")
+    
+    codec_ctx = av.codec.CodecContext.create("h264", "r")
     
     def recv_n(n):
         buf = b''
@@ -77,34 +82,49 @@ def network_thread_func(sock):
 
     while running:
         try:
-            # Header: [SeqID (4)][Size (4)] => 8 bytes
-            h = recv_n(8)
+            # Header: [Size (4)] => 4 bytes
+            h = recv_n(4)
             if not h: break
             
-            seq_id, size = struct.unpack(">LL", h)
+            size = struct.unpack(">L", h)[0]
             
             # Body
             data = recv_n(size)
             if not data: break
             
-            # LOGIC: DROP IF OLD
-            # If we receive frame 100 but we already displayed frame 101, 
-            # 100 is useless trash. Drop it.
-            with frame_lock:
-                if seq_id > latest_frame_seq:
-                    latest_frame = data
-                    latest_frame_seq = seq_id
-                    # Update stats (Seq Gap?)
-                else:
-                    # Dropped outdated frame
-                    pass
+            # Decode
+            try:
+                packet = av.Packet(data)
+                frames = codec_ctx.decode(packet)
+                
+                if not frames:
+                    print(f"Packet recu ({len(data)} octets) -> Aucun frame décodée (Buffering ou Manque Keyframe)")
+                    
+                for frame in frames:
+                    print(f"Image décodée: {frame.width}x{frame.height} | Keyframe: {frame.key_frame}")
+                    # Convert to RGB (numpy)
+                    # format='rgb24' gives HxWx3 array
+                    img_array = frame.to_ndarray(format='rgb24')
+                    h, w = img_array.shape[:2]
+                    
+                    # Convert to bytes for Pygame
+                    # Note: We could blit directly from array if we used "pygame.surfarray"
+                    # But sticking to bytes is safe.
+                    raw_bytes = img_array.tobytes()
+                    
+                    with frame_lock:
+                        latest_frame = (raw_bytes, w, h)
+                        
+            except Exception as e:
+                print(f"Decode Error: {e}")
+                pass
                     
         except Exception as e:
             print(f"[NET ERR] {e}")
             break
 
 def main():
-    global running, latest_frame, latest_frame_seq
+    global running, latest_frame
     
     # 1. Discovery
     target_ip = None
@@ -139,8 +159,9 @@ def main():
     # 3. Pygame
     pygame.init()
     info = pygame.display.Info()
-    w, h = info.current_w, info.current_h
-    screen = pygame.display.set_mode((w, h), pygame.FULLSCREEN | pygame.DOUBLEBUF | pygame.HWSURFACE)
+    # screen = pygame.display.set_mode((w, h), pygame.FULLSCREEN | pygame.DOUBLEBUF | pygame.HWSURFACE)
+    # Start with a safe default, will resize on first frame
+    screen = pygame.display.set_mode((1280, 720), pygame.FULLSCREEN | pygame.SCALED)
     pygame.mouse.set_visible(False)
     clock = pygame.time.Clock()
     
@@ -186,15 +207,28 @@ def main():
                     if update: send_command(sock, config)
 
         # Render
-        data = None
+        frame_info = None
         with frame_lock:
-            data = latest_frame
+            frame_info = latest_frame
         
-        if data:
+        if frame_info:
+            raw_bytes, w, h = frame_info
             try:
-                img = pygame.image.load(io.BytesIO(data))
-                screen.blit(img, (0,0))
-            except: pass
+                # Create surface from raw bytes
+                img_surf = pygame.image.frombuffer(raw_bytes, (w, h), "RGB")
+                
+                # Hardware Scaling Logic (Pygame 2+)
+                screen_w, screen_h = screen.get_size()
+                
+                # If resolution changed, re-init display (Hardware Scaler)
+                if w != screen_w or h != screen_h:
+                    # print(f"Resizing Display to: {w}x{h}")
+                    screen = pygame.display.set_mode((w, h), pygame.FULLSCREEN | pygame.SCALED)
+                
+                screen.blit(img_surf, (0,0))
+            except Exception as e:
+                # print(e)
+                pass
             
         # Menu
         if show_menu:
@@ -209,7 +243,7 @@ def main():
                 f"Qualité: {config['quality']}% (Haut/Bas)",
                 f"FPS Cible: {config['fps']} (Gauche/Droite)",
                 f"Résolution: {config['res']} (R)",
-                f"Dernière SeqID: {latest_frame_seq}"
+                f"Résolution: {config['res']} (R)",
             ]
             for i, l in enumerate(lines):
                 txt = font.render(l, True, (0, 255, 255))

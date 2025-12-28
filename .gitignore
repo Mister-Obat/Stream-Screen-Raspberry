@@ -4,3 +4,5 @@ __pycache__/
 *.lnk
 stream_config.json
 debug_log.txt
+sender_debug.log
+Images/*.old.png

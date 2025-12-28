@@ -18,6 +18,8 @@ import os
 import ctypes
 from ctypes import windll, Structure, c_long, c_uint, c_void_p, byref, sizeof
 from PIL import Image, ImageTk
+import queue
+from stream_encoder import VideoEncoder
 
 # --- TASKBAR ICON PERSISTENCE (Windows) ---
 # Création d'un ID unique basé sur le nom du fichier du script
@@ -76,12 +78,18 @@ class StreamState:
     def __init__(self):
         self.streaming = False  # Controls the capture loop
         self.monitor_idx = 0    # Default to Screen 0 (Index 0 in list)
-        self.backend = "DXCam"  # Default to DXCam
-        self.fps = 60
+        self.backend = "MSS"  # Default to MSS (CPU)
+        self.codec_choice = "x264" # Default CPU
+        self.encoder_preset = "fast" # fast/balanced/quality (fast=ultrafast for x264)
+        self.latency_value = 10 # 0-100 (Low to High buffering)
+        self.dropped_frames = 0
+        self.loss_percent = 0.0
+        self.fps = 15
         self.quality = 50
-        self.resolution = "720p" 
-        self.target_w = 1280
-        self.target_h = 720
+        self.bitrate_mbps = 5.0 # Default 5 Mbps
+        self.resolution = "480p" 
+        self.target_w = 854
+        self.target_h = 480
         self.dxcam_mapping = {}
         
         # Pi Config
@@ -104,8 +112,12 @@ class StreamState:
         data = {
             "monitor_idx": self.monitor_idx,
             "backend": self.backend,
+            "codec_choice": self.codec_choice,
+            "encoder_preset": self.encoder_preset,
+            "latency_value": self.latency_value,
             "fps": self.fps,
             "quality": self.quality,
+            "bitrate_mbps": self.bitrate_mbps,
             "resolution": self.resolution,
             
             # Save flags
@@ -138,9 +150,25 @@ class StreamState:
                     data = json.load(f)
                     self.monitor_idx = data.get("monitor_idx", 0)
                     self.backend = data.get("backend", "DXCam")
+                    self.codec_choice = data.get("codec_choice", "auto")
+                    self.encoder_preset = data.get("encoder_preset", "fast")
+                    self.latency_value = data.get("latency_value", 20)
                     self.fps = data.get("fps", 60)
                     self.quality = data.get("quality", 50)
+                    self.bitrate_mbps = data.get("bitrate_mbps", 4.0)
                     self.resolution = data.get("resolution", "720p")
+                    
+                    # Apply resolution dims (Restore target_w/h)
+                    r = self.resolution
+                    if r == "360p": self.target_w, self.target_h = 640, 360
+                    elif r == "480p": self.target_w, self.target_h = 854, 480
+                    elif r == "540p": self.target_w, self.target_h = 960, 540
+                    elif r == "720p": self.target_w, self.target_h = 1280, 720
+                    elif r == "900p": self.target_w, self.target_h = 1600, 900
+                    elif r == "1080p": self.target_w, self.target_h = 1920, 1080
+                    elif r == "1440p": self.target_w, self.target_h = 2560, 1440
+                    elif r == "4K": self.target_w, self.target_h = 3840, 2160
+                    elif r == "Native": self.target_w, self.target_h = 0, 0
                     
                     self.remember_ip = data.get("remember_ip", True)
                     self.remember_user = data.get("remember_user", True)
@@ -163,28 +191,29 @@ state = StreamState()
 state.load()
 
 # --- HELPER: STREAM BUFFER ---
+# --- HELPER: STREAM BUFFER (FIFO Queue for H.264) ---
 class StreamBuffer:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.frame_data = None
-        self.seq = 0
-        self.new_data_event = threading.Event()
+    def __init__(self, maxsize=200): # Reduced from 500
+        self.q = queue.Queue(maxsize=maxsize)
         self.running = True
 
-    def put(self, data, seq):
-        with self.lock:
-            self.frame_data = data
-            self.seq = seq
-            self.new_data_event.set()
+    def put(self, packet):
+        if not self.running: return
+        try:
+            self.q.put_nowait(packet)
+            return True
+        except queue.Full:
+            return False
 
+    def clear(self):
+        with self.q.mutex:
+            self.q.queue.clear()
+            
     def get(self):
-        has_data = self.new_data_event.wait(timeout=1.0)
-        if not has_data or not self.running:
-            return None, None
-        
-        with self.lock:
-            self.new_data_event.clear()
-            return self.frame_data, self.seq
+        try:
+            return self.q.get(timeout=1.0)
+        except queue.Empty:
+            return None
 
 buffer_obj = StreamBuffer()
 
@@ -256,22 +285,34 @@ def get_cursor_pos_fast():
     return pt.x, pt.y
 
 IDC_ARROW, IDC_HAND, IDC_IBEAM = 32512, 32649, 32513
-def draw_cursor_arrow(img, x, y):
-    pts = np.array([[x, y], [x, y+16], [x+4, y+13], [x+7, y+20], [x+10, y+19], [x+6, y+12], [x+11, y+11]], np.int32)
+def draw_cursor_arrow(img, x, y, scale=1.0):
+    # Base coords for 720p/1080p roughly
+    # Points: Tip(0,0), BottomLeft(0,16), Inner(4,13), TailBott(7,20), TailTop(10,19), InnerRight(6,12), Right(11,11)
+    base_pts = [[0, 0], [0, 16], [4, 13], [7, 20], [10, 19], [6, 12], [11, 11]]
+    
+    # Scale points
+    scaled_pts = []
+    for px, py in base_pts:
+        scaled_pts.append([x + int(px * scale), y + int(py * scale)])
+        
+    pts = np.array(scaled_pts, np.int32)
     pts = pts.reshape((-1, 1, 2))
     cv2.fillPoly(img, [pts], (255, 255, 255))
-    cv2.polylines(img, [pts], True, (0, 0, 0), 1)
+    cv2.polylines(img, [pts], True, (0, 0, 0), max(1, int(1 * scale)))
 
-# --- THREADS ---
+# --- THREADS (Updated for Real-time Config) ---
 def sender_loop(sock):
     buffer_obj.running = True
     try:
         while state.streaming:
-            data, seq = buffer_obj.get()
-            if data is None: continue 
-            header = struct.pack(">LL", seq, len(data))
-            sock.sendall(header + data)
-    except: pass
+            packet = buffer_obj.get()
+            if packet is None: continue 
+            # Packet structure: [Size (4 bytes)] + [Data]
+            # logger.info(f"Sending packet size: {len(packet)}") # DEBUG-FLOOD
+            header = struct.pack(">L", len(packet))
+            sock.sendall(header + packet)
+    except Exception as e:
+        logger.error(f"Sender Loop Error: {e}")
 
 def stream_thread_func():
     logger.info("Stream Thread Started")
@@ -281,10 +322,12 @@ def stream_thread_func():
     
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # Important for Latency: Disable Nagle
+    server.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     try:
         server.bind(('0.0.0.0', DEFAULT_PORT))
         server.listen(1)
-        server.settimeout(1.0)
+        server.settimeout(15.0) # 15s Auto-Stop Timeout
     except Exception as e:
         logger.error(f"Bind Error: {e}")
         return
@@ -303,11 +346,15 @@ def stream_thread_func():
     conn = None
     dxcam_camera = None
     sct = None
+    encoder = None
     
     current_backend = None
+    current_codec_choice = None
+    current_preset = None
+    current_resolution = None
     current_mon_idx = -1
-    
-    seq = 0
+    current_fps = -1
+    current_bitrate_mbps = -1.0
     
     # Monitor Geometry
     mon_left, mon_top, mon_width, mon_height = 0, 0, 1920, 1080
@@ -317,6 +364,17 @@ def stream_thread_func():
     frame_count = 0
     last_stat_time = time.time()
     
+    # Deduplication
+    last_frame_data = None
+    last_cursor_pos = (-1, -1)
+    
+    # 1s Window Stats
+    frames_total_sec = 0
+    frames_dropped_sec = 0
+    state.loss_percent = 0.0
+    
+    last_send_time = time.time()
+    
     while state.streaming:
         # A. Connection
         if conn is None:
@@ -324,23 +382,45 @@ def stream_thread_func():
                 conn, addr = server.accept()
                 conn.settimeout(None)
                 logger.info(f"Client connected: {addr}")
-                seq = 0
                 buffer_obj.running = True
                 threading.Thread(target=sender_loop, args=(conn,), daemon=True).start()
             except socket.timeout:
-                continue
+                # TIMEOUT: No client for 15s -> Auto Stop
+                logger.warning("Auto-Stop: No client connected for 15s.")
+                state.streaming = False
+                # Note: The main thread loop will now exit
+                break
             except:
                 continue
 
-        # B. Init/Re-init Capture
-        # Check if backend or monitor changed
-        if (current_backend != state.backend) or (current_mon_idx != state.monitor_idx):
+        # B. Init/Re-init Capture & Encoder
+        # Check if backend, monitor, fps, or bitrate changed
+        if (current_backend != state.backend) or \
+           (current_codec_choice != state.codec_choice) or \
+           (current_preset != state.encoder_preset) or \
+           (current_resolution != state.resolution) or \
+           (current_mon_idx != state.monitor_idx) or \
+           (current_fps != state.fps) or \
+           (abs(current_bitrate_mbps - state.bitrate_mbps) > 0.1) or \
+           (encoder is None):
+            
             # Cleanup
             if dxcam_camera: dxcam_camera.stop(); dxcam_camera = None
             if sct: sct.close(); sct = None
+            if encoder: encoder.close(); encoder = None
             
             current_backend = state.backend
+            current_codec_choice = state.codec_choice
+            current_preset = state.encoder_preset
+            current_resolution = state.resolution
             current_mon_idx = state.monitor_idx
+            current_fps = state.fps
+            current_bitrate_mbps = state.bitrate_mbps
+            
+            # Clear Buffer to prevent lag/sync issues
+            buffer_obj.clear()
+            
+            logger.info(f"Re-initializing Stream: {current_backend} | {current_fps} FPS | {current_bitrate_mbps:.1f} Mbps")
             
             # Geometry
             try:
@@ -352,7 +432,23 @@ def stream_thread_func():
                         mon_width, mon_height = m["width"], m["height"]
             except: pass
             
-            # Init
+            # Init Encoder
+            enc_w, enc_h = state.target_w, state.target_h
+            if state.resolution == "Native" or enc_w <= 0:
+                 enc_w, enc_h = mon_width, mon_height
+            
+            # Ensure even dimensions (required for some codecs)
+            if enc_w % 2 != 0: enc_w -= 1
+            if enc_h % 2 != 0: enc_h -= 1
+            
+            # Bitrate configuration (User controlled)
+            # Convert Mbps to bps
+            bitrate_bps = int(state.bitrate_mbps * 1000 * 1000)
+            
+            logger.info(f"[ENCODER INIT] Res: {enc_w}x{enc_h} | FPS: {state.fps} | Bitrate: {state.bitrate_mbps}M | Codec: {state.codec_choice} | Preset: {state.encoder_preset}")
+            encoder = VideoEncoder(enc_w, enc_h, state.fps, bitrate_bps, codec_choice=state.codec_choice, preset_choice=state.encoder_preset)
+            
+            # Init Capture
             if current_backend == "DXCam":
                 try:
                     t_idx = state.dxcam_mapping.get(state.monitor_idx, state.monitor_idx)
@@ -369,6 +465,8 @@ def stream_thread_func():
         frame_bgr = None
         
         try:
+            # T1: Capture
+            t1 = time.time()
             if current_backend == "DXCam" and dxcam_camera:
                 raw = dxcam_camera.get_latest_frame()
                 if raw is not None:
@@ -380,45 +478,125 @@ def stream_thread_func():
                     img = sct.grab(sct.monitors[mon_id])
                     frame_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_BGRA2BGR)
                     frame_ready = True
+            t2 = time.time()
 
             if frame_ready and frame_bgr is not None:
                 # Resize
                 h, w = frame_bgr.shape[:2]
-                tw, th = state.target_w, state.target_h
-                if state.resolution == "Native": tw, th = w, h
+                tw, th = encoder.width, encoder.height
                 
-                if (w != tw or h != th) and tw > 0 and th > 0:
+                if (w != tw or h != th):
                     frame_bgr = cv2.resize(frame_bgr, (tw, th))
                 
                 # Cursor
                 mx, my = get_cursor_pos_fast()
                 rx = int((mx - mon_left) * tw / w) if w else -100
                 ry = int((my - mon_top) * th / h) if h else -100
-                if 0 <= rx < tw and 0 <= ry < th:
-                    draw_cursor_arrow(frame_bgr, rx, ry)
                 
-                # Encode
-                ret, buf = cv2.imencode('.jpg', frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), state.quality])
-                if ret:
-                    data_bytes = buf.tobytes()
-                    buffer_obj.put(data_bytes, seq)
-                    seq += 1
+                # Scale cursor relative to 720p (User preference)
+                # If res is 360p (h=360) -> scale = 0.5
+                # If res is 1080p (h=1080) -> scale = 1.5
+                cursor_scale = th / 720.0 
+                # Clamp min size so it doesn't disappear
+                cursor_scale = max(0.5, cursor_scale)
+
+                # DEDUPLICATION CHECK
+                # Need to check if FRAME changed OR CURSOR changed
+                # Fast check on cursor first
+                cursor_changed = (mx != last_cursor_pos[0] or my != last_cursor_pos[1])
+                
+                # We can't easily check 'frame changed' BEFORE drawing cursor if we draw ON the frame.
+                # So verify frame content (without cursor) first.
+                frame_changed = False
+                if last_frame_data is None:
+                    frame_changed = True
+                else:
+                    # np.array_equal is robust but can be slow. 
+                    # Optimization: Check pure bytes if possible or just rely on numpy C-speed.
+                    if not np.array_equal(frame_bgr, last_frame_data):
+                        frame_changed = True
+                
+                if not frame_changed and not cursor_changed:
+                    # Nothing moved! 
+                    # prevent connection timeout (Heartbeat) - Send at least every 0.5s
+                    if time.time() - last_send_time < 0.5:
+                        # Sleep slightly to prevent CPU spin
+                        time.sleep(0.01)
+                        continue
+
+                # Update Last State
+                last_frame_data = frame_bgr.copy() # Copy is needed as frame_bgr is mutable
+                last_cursor_pos = (mx, my)
+                last_send_time = time.time()
+                
+                if 0 <= rx < tw and 0 <= ry < th:
+                    draw_cursor_arrow(frame_bgr, rx, ry, scale=cursor_scale)
+                
+                t3 = time.time()
+
+                # ENCODE (H.264)
+                packets = encoder.encode(frame_bgr)
+                t4 = time.time()
+                
+                if not packets:
+                   # logger.warning("Encoder returned no packets!")
+                   pass
+
+                # Smart Buffer Management
+                # Latency Formula: Queue Size / Packets_Per_frame / FPS
+                # User Latency Setting: 1...100
+                # Min threshold (Realtime): 5 packets
+                # Max threshold (Stability): 500 packets (was old max)
+                user_threshold = max(5, int(state.latency_value * 5))
+                
+                frames_total_sec += 1
+                q_size = buffer_obj.q.qsize()
+                if q_size > user_threshold: 
+                    # Drop frame
+                    state.dropped_frames += 1
+                    frames_dropped_sec += 1
+                    logger.warning(f"Latency Prevented! Dropping frame (Q:{q_size} > {user_threshold})")
+                else:
+                    # Send Packets
+                    for pkt in packets:
+                        if not buffer_obj.put(pkt):
+                            logger.warning("Buffer FULL! Packet lost.")
+                            
+                    byte_count += sum(len(p) for p in packets)
+                
+                frame_count += 1
+                
+                # Update Stats
+                t_now = time.time()
+                if t_now - last_stat_time >= 1.0:
+                    state.current_fps = frame_count
+                    state.current_mbps = (byte_count * 8) / (1000 * 1000)
                     
-                    # Update Stats
-                    byte_count += len(data_bytes)
-                    frame_count += 1
+                    # Calc Loss %
+                    if frames_total_sec > 0:
+                         state.loss_percent = (frames_dropped_sec / frames_total_sec) * 100.0
+                    else:
+                         state.loss_percent = 0.0
+                         
+                    # Reset Window
+                    frames_total_sec = 0
+                    frames_dropped_sec = 0
+
+                    # logger.info(f"Stats: {state.current_fps} FPS, {state.current_mbps:.2f} Mbps, Queue Size: {buffer_obj.q.qsize()}")
+                    # Profiling Log
+                    cap_ms = (t2 - t1) * 1000
+                    proc_ms = (t3 - t2) * 1000
+                    enc_ms = (t4 - t3) * 1000
+                    total_ms = (t4 - t1) * 1000
+                    logger.info(f"FPS:{state.current_fps} | Mbps:{state.current_mbps:.1f} | Q:{buffer_obj.q.qsize()} | Loss:{state.loss_percent:.1f}% | Times(ms) Cap:{cap_ms:.1f} Proc:{proc_ms:.1f} Enc:{enc_ms:.1f} Tot:{total_ms:.1f}")
                     
-                    t_now = time.time()
-                    if t_now - last_stat_time >= 1.0:
-                        state.current_fps = frame_count
-                        # bytes * 8 / 1000 / 1000 = Mbps
-                        state.current_mbps = (byte_count * 8) / (1000 * 1000)
-                        
-                        byte_count = 0
-                        frame_count = 0
-                        last_stat_time = t_now
+                    byte_count = 0
+                    frame_count = 0
+                    last_stat_time = t_now
                     
-        except: pass
+        except Exception as e:
+            logger.error(f"Stream Loop Error: {e}")
+            pass
         
         # FPS Cap
         dt = time.time() - t_start
@@ -427,9 +605,9 @@ def stream_thread_func():
 
     # Cleanup when loop ends
     buffer_obj.running = False
-    buffer_obj.new_data_event.set()
     if conn: conn.close()
     if dxcam_camera: dxcam_camera.stop()
+    if encoder: encoder.close()
     server.close()
     logger.info("Stream Thread Stopped")
 
@@ -440,7 +618,7 @@ class StreamApp(ctk.CTk):
         
         # Setup
         self.title("Stream Screen")
-        self.geometry("450x650")
+        self.geometry("450x790")
         ctk.set_appearance_mode("Dark")
         ctk.set_default_color_theme("blue")
         
@@ -478,36 +656,58 @@ class StreamApp(ctk.CTk):
         if state.monitor_idx < len(self.mons):
             self.opt_mon.set(self.mons[state.monitor_idx])
             
-        # 2. Mode
+        # 2. Architecture (Engine)
         self.frm_mode = ctk.CTkFrame(self.tab_stream)
         self.frm_mode.pack(fill="x", pady=5)
-        ctk.CTkLabel(self.frm_mode, text="Mode de Capture:", font=("Arial", 12, "bold")).pack(anchor="w", padx=10, pady=5)
-        self.opt_mode = ctk.CTkOptionMenu(self.frm_mode, values=["DXCam (Rapide)", "MSS (Compatible)"], command=self.on_mode_change)
-        self.opt_mode.pack(fill="x", padx=10, pady=5)
-        self.opt_mode.set("DXCam (Rapide)" if state.backend == "DXCam" else "MSS (Compatible)")
+        ctk.CTkLabel(self.frm_mode, text="Architecture:", font=("Arial", 12, "bold")).pack(anchor="w", padx=10, pady=5)
+        
+        self.opt_engine = ctk.CTkOptionMenu(self.frm_mode, values=["NVIDIA / GPU (Rapide)", "Processeur / CPU (Compatible)"], command=self.on_engine_change)
+        self.opt_engine.pack(fill="x", padx=10, pady=5)
+        
+        # Determine initial selection
+        if state.backend == "DXCam" and state.codec_choice in ["auto", "nvenc"]:
+             self.opt_engine.set("NVIDIA / GPU (Rapide)")
+        else:
+             self.opt_engine.set("Processeur / CPU (Compatible)")
+             
+        # Preset
+        ctk.CTkLabel(self.frm_mode, text="Préréglage (Vitesse/Qualité):", font=("Arial", 12, "bold")).pack(anchor="w", padx=10, pady=5)
+        self.opt_preset = ctk.CTkOptionMenu(self.frm_mode, command=self.on_preset_change)
+        self.opt_preset.pack(fill="x", padx=10, pady=5)
+        self.update_preset_options()
 
-        # 3. Settings (FPS/Quality/Res)
+        # 3. Settings (FPS/Bitrate/Res)
         self.frm_set = ctk.CTkFrame(self.tab_stream)
         self.frm_set.pack(fill="x", pady=5)
         
         # FPS
-        # FPS
         self.lbl_fps_val = ctk.CTkLabel(self.frm_set, text=f"FPS Cible: {state.fps}")
         self.lbl_fps_val.pack(anchor="w", padx=10)
-        self.sld_fps = ctk.CTkSlider(self.frm_set, from_=10, to=120, number_of_steps=11, command=self.on_fps_change)
+        self.sld_fps = ctk.CTkSlider(self.frm_set, from_=5, to=120, number_of_steps=115, command=self.on_fps_change)
         self.sld_fps.set(state.fps)
         self.sld_fps.pack(fill="x", padx=10, pady=5)
         
-        # Quality
-        self.lbl_qual_val = ctk.CTkLabel(self.frm_set, text=f"Qualité: {state.quality}%")
-        self.lbl_qual_val.pack(anchor="w", padx=10)
-        self.sld_qual = ctk.CTkSlider(self.frm_set, from_=10, to=100, number_of_steps=90, command=self.on_qual_change)
-        self.sld_qual.set(state.quality)
-        self.sld_qual.pack(fill="x", padx=10, pady=5)
+        # Bitrate (Mbps)
+        self.lbl_bit_val = ctk.CTkLabel(self.frm_set, text=f"Bitrate: {state.bitrate_mbps:.1f} Mbps")
+        self.lbl_bit_val.pack(anchor="w", padx=10)
+        
+        # Logarithmic or linear? Linear 0.1 to 25.0
+        self.sld_bit = ctk.CTkSlider(self.frm_set, from_=0.1, to=25.0, number_of_steps=249, command=self.on_bitrate_change)
+        self.sld_bit.set(state.bitrate_mbps)
+        self.sld_bit.pack(fill="x", padx=10, pady=5)
+
+        # Latency Slider
+        self.lbl_lat = ctk.CTkLabel(self.frm_set, text=f"Latence vs Stabilité: {state.latency_value}%")
+        self.lbl_lat.pack(anchor="w", padx=10)
+        self.sld_lat = ctk.CTkSlider(self.frm_set, from_=1, to=100, number_of_steps=99, command=self.on_latency_change)
+        self.sld_lat.set(state.latency_value)
+        self.sld_lat.pack(fill="x", padx=10, pady=5)
         
         # Res
-        ctk.CTkLabel(self.frm_set, text="Résolution:").pack(anchor="w", padx=10)
-        self.opt_res = ctk.CTkOptionMenu(self.frm_set, values=["480p", "720p", "1080p", "Native"], command=self.on_res_change)
+        ctk.CTkLabel(self.frm_set, text="Résolution de Sortie:").pack(anchor="w", padx=10)
+        self.opt_res = ctk.CTkOptionMenu(self.frm_set, values=[
+            "Native", "360p", "480p", "540p", "720p", "900p", "1080p", "1440p", "4K"
+        ], command=self.on_res_change)
         self.opt_res.pack(fill="x", padx=10, pady=10)
         self.opt_res.set(state.resolution)
 
@@ -583,8 +783,14 @@ class StreamApp(ctk.CTk):
         self.btn_pi.pack(fill="x", padx=10, pady=20)
         
         # Footer
-        self.lbl_status = ctk.CTkLabel(self, text="Status: Prêt", text_color="gray")
-        self.lbl_status.pack(side="bottom", pady=5)
+        self.frm_footer = ctk.CTkFrame(self, fg_color="transparent")
+        self.frm_footer.pack(side="bottom", fill="x", padx=10, pady=5)
+        
+        self.lbl_status = ctk.CTkLabel(self.frm_footer, text="Status: Prêt", text_color="gray")
+        self.lbl_status.pack(side="left")
+        
+        self.lbl_drop = ctk.CTkLabel(self.frm_footer, text="Perte: 0%", text_color="gray")
+        self.lbl_drop.pack(side="right")
         
         # Start Monitor Loop
         self.monitor_stats()
@@ -593,13 +799,9 @@ class StreamApp(ctk.CTk):
         if state.streaming:
             msg = f"Status: En Ligne | {state.current_fps} FPS | {state.current_mbps:.2f} Mbps"
             color = "green"
-            # Update Quality Label dynamically to show Mbps?
-            # User request: "pour la qualité j'aimerais l'info affiché en mbps"
-            self.lbl_qual_val.configure(text=f"Qualité: {state.quality}%  ({state.current_mbps:.1f} Mbps)")
         else:
             msg = "Status: Arrêté"
             color = "gray"
-            self.lbl_qual_val.configure(text=f"Qualité: {state.quality}%")
             
         if self.btn_start.cget("text") == "STOPPER LE FLUX": # Only update if running to avoid overriding connection messages
              self.lbl_status.configure(text=msg, text_color=color)
@@ -611,25 +813,68 @@ class StreamApp(ctk.CTk):
         state.monitor_idx = idx
         self.save_config()
 
-    def on_mode_change(self, choice):
-        state.backend = "MSS" if "MSS" in choice else "DXCam"
+    def on_engine_change(self, choice):
+        if "NVIDIA" in choice:
+            state.backend = "DXCam"
+            state.codec_choice = "auto" # Auto prefers NVENC
+        else:
+            state.backend = "MSS"
+            state.codec_choice = "x264"
+        self.update_preset_options()
+        self.save_config()
+        
+    def update_preset_options(self):
+        if state.codec_choice == "x264" or state.backend == "MSS":
+            # X264 Options
+            self.opt_preset.configure(values=["Performance (Ultrafast)", "Equilibré (Superfast)", "Qualité (Veryfast)"])
+            # Map internal to display
+            val = "Performance (Ultrafast)"
+            if state.encoder_preset == "balanced": val = "Equilibré (Superfast)"
+            elif state.encoder_preset == "quality": val = "Qualité (Veryfast)"
+            self.opt_preset.set(val)
+        else:
+            # NVENC Options
+            self.opt_preset.configure(values=["Performance (P1 - Latence Min)", "Equilibré (P3)", "Qualité (P4)"])
+             # Map internal to display
+            val = "Performance (P1 - Latence Min)"
+            if state.encoder_preset == "balanced": val = "Equilibré (P3)"
+            elif state.encoder_preset == "quality": val = "Qualité (P4)"
+            self.opt_preset.set(val)
+            
+    def on_preset_change(self, choice):
+        if "Performance" in choice: state.encoder_preset = "fast"
+        elif "Equilibré" in choice: state.encoder_preset = "balanced"
+        elif "Qualité" in choice: state.encoder_preset = "quality"
         self.save_config()
 
     def on_fps_change(self, val):
         state.fps = int(val)
         self.lbl_fps_val.configure(text=f"FPS Cible: {state.fps}")
+        # Note: stream_thread will pick this up automatically now
         self.save_config()
 
-    def on_qual_change(self, val):
-        state.quality = int(val)
-        self.lbl_qual_val.configure(text=f"Qualité: {state.quality}%")
+    def on_bitrate_change(self, val):
+        state.bitrate_mbps = float(val)
+        self.lbl_bit_val.configure(text=f"Bitrate: {state.bitrate_mbps:.1f} Mbps")
+        self.save_config()
+
+    def on_latency_change(self, val):
+        state.latency_value = int(val)
+        self.lbl_lat.configure(text=f"Latence vs Stabilité: {state.latency_value}%")
         self.save_config()
 
     def on_res_change(self, choice):
         state.resolution = choice
-        if choice == "720p": state.target_w, state.target_h = 1280, 720
-        elif choice == "1080p": state.target_w, state.target_h = 1920, 1080
+        if choice == "360p": state.target_w, state.target_h = 640, 360
         elif choice == "480p": state.target_w, state.target_h = 854, 480
+        elif choice == "540p": state.target_w, state.target_h = 960, 540
+        elif choice == "720p": state.target_w, state.target_h = 1280, 720
+        elif choice == "900p": state.target_w, state.target_h = 1600, 900
+        elif choice == "1080p": state.target_w, state.target_h = 1920, 1080
+        elif choice == "1440p": state.target_w, state.target_h = 2560, 1440
+        elif choice == "4K": state.target_w, state.target_h = 3840, 2160
+        elif choice == "Native": state.target_w, state.target_h = 0, 0
+        logger.info(f"Resolution Changed to: {choice} ({state.target_w}x{state.target_h})")
         self.save_config()
 
     def save_config(self):
@@ -658,6 +903,24 @@ class StreamApp(ctk.CTk):
             state.streaming = False
             self.btn_start.configure(text="LANCER LE FLUX", fg_color="green", hover_color="darkgreen")
             self.lbl_status.configure(text="Status: Arrêté", text_color="gray")
+
+        # Start Metric Update Loop
+        self.update_metrics()
+        
+    def update_metrics(self):
+        if state.streaming:
+            # Update Drop Count (Percent)
+            pct = state.loss_percent
+            col = "green"
+            if pct > 1.0: col = "orange" 
+            if pct > 10.0: col = "red"
+            self.lbl_drop.configure(text=f"Perte: {pct:.0f}%", text_color=col)
+        else:
+             # Stream stopped (Auto-stop or other), reset UI
+             if self.btn_start.cget("text") == "STOPPER LE FLUX":
+                 self.toggle_stream() # Logic handles UI reset
+            
+        self.after(1000, self.update_metrics)
 
     def launch_pi(self):
         ip = self.ent_ip.get()
@@ -743,6 +1006,16 @@ class StreamApp(ctk.CTk):
         threading.Thread(target=ssh_task, daemon=True).start()
 
 if __name__ == "__main__":
+    # Priority Boost
+    try:
+        pid = os.getpid()
+        import psutil
+        p = psutil.Process(pid)
+        p.nice(psutil.HIGH_PRIORITY_CLASS)
+        logger.info("Process Priority set to HIGH")
+    except:
+        logger.warning("Could not set Process Priority (psutil missing?)")
+
     app = StreamApp()
     app.mainloop()
     state.streaming = False
