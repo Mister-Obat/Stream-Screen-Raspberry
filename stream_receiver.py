@@ -68,6 +68,9 @@ def network_thread_func(sock):
     
     print("[NET] Thread démarré (H.264 Decoder).")
     
+    # 30 seconds timeout for auto-stop (Allows time for Sender Restart)
+    sock.settimeout(30.0)
+    
     codec_ctx = av.codec.CodecContext.create("h264", "r")
     
     def recv_n(n):
@@ -77,16 +80,32 @@ def network_thread_func(sock):
                 c = sock.recv(n - len(buf))
                 if not c: return None
                 buf += c
-            except: return None
+            except socket.timeout:
+                raise # Propagate timeout
+            except Exception: 
+                return None
         return buf
 
     while running:
         try:
             # Header: [Size (4)] => 4 bytes
-            h = recv_n(4)
+            try:
+                h = recv_n(4)
+            except socket.timeout:
+                print("[NET] Timeout: Pas de données depuis 30s. Arrêt.")
+                running = False
+                break
+                
             if not h: break
             
             size = struct.unpack(">L", h)[0]
+            
+            # SANITY CHECK: > 10MB frame is likely garbage/corruption
+            if size > 10_000_000:
+                print(f"[NET] ERREUR: Trame trop grosse ({size} bytes). Corruption probable.")
+                running = False
+                break
+
             
             # Body
             data = recv_n(size)
@@ -98,10 +117,21 @@ def network_thread_func(sock):
                 frames = codec_ctx.decode(packet)
                 
                 if not frames:
-                    print(f"Packet recu ({len(data)} octets) -> Aucun frame décodée (Buffering ou Manque Keyframe)")
-                    
+                    print(f"Packet recu ({len(data)} octets) -> Aucun frame decodee (Buffering ou Manque Keyframe)")
+                
+                # Setup state for resolution logging
+                if not hasattr(network_thread_func, "last_res"):
+                     network_thread_func.last_res = (0, 0)
+                     
                 for frame in frames:
-                    print(f"Image décodée: {frame.width}x{frame.height} | Keyframe: {frame.key_frame}")
+                    # Log only on resolution change
+                    if (frame.width, frame.height) != network_thread_func.last_res:
+                        print(f"[VIDEO] Resolution: {frame.width}x{frame.height}")
+                        network_thread_func.last_res = (frame.width, frame.height)
+                    
+                    # Log Keyframes sparingly? No, keep it clean.
+                    # if frame.key_frame: print("[VIDEO] Keyframe received")
+
                     # Convert to RGB (numpy)
                     # format='rgb24' gives HxWx3 array
                     img_array = frame.to_ndarray(format='rgb24')
@@ -122,6 +152,10 @@ def network_thread_func(sock):
         except Exception as e:
             print(f"[NET ERR] {e}")
             break
+            
+    print("[NET] Fin du thread réseau. Arrêt de l'application.")
+    running = False
+
 
 def main():
     global running, latest_frame
@@ -250,7 +284,7 @@ def main():
                 screen.blit(txt, (70, 70 + i*50))
 
         pygame.display.flip()
-        clock.tick(120)
+        clock.tick(60)
 
     sock.close()
     pygame.quit()

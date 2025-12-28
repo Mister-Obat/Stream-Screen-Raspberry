@@ -73,6 +73,27 @@ class SimpleCrypto:
             return SimpleCrypto._xor(decoded_xor, SimpleCrypto.KEY)
         except: return ""
 
+# --- LOGGING GUI HANDLER ---
+class TextHandler(logging.Handler):
+    def __init__(self, text_widget):
+        super().__init__()
+        self.text_widget = text_widget
+        self.enabled = True # Control Visibility
+
+    def emit(self, record):
+        if not self.enabled: return
+        
+        msg = self.format(record)
+        def append():
+            self.text_widget.configure(state="normal")
+            self.text_widget.insert("end", msg + "\n")
+            self.text_widget.see("end")
+            self.text_widget.configure(state="disabled")
+        try:
+             # Schedule GUI update on main thread
+             self.text_widget.after(0, append)
+        except: pass
+
 # --- GLOBAL STATE ---
 class StreamState:
     def __init__(self):
@@ -555,7 +576,10 @@ def stream_thread_func():
                     # Drop frame
                     state.dropped_frames += 1
                     frames_dropped_sec += 1
-                    logger.warning(f"Latency Prevented! Dropping frame (Q:{q_size} > {user_threshold})")
+                    # RATE LIMIT LOGGING (Prevent Spam)
+                    # Use dropped count or time to limit to ~1 log/sec
+                    if state.dropped_frames % state.fps == 0: 
+                         logger.warning(f"Latency Prevented! Dropping frame (Q:{q_size} > {user_threshold})")
                 else:
                     # Send Packets
                     for pkt in packets:
@@ -641,6 +665,25 @@ class StreamApp(ctk.CTk):
         
         self.tab_stream = self.tabs.add("Stream")
         self.tab_pi = self.tabs.add("Raspberry Pi")
+        self.tab_console = self.tabs.add("Console")
+        
+        # === TAB: CONSOLE ===
+        self.frm_cons_ctrl = ctk.CTkFrame(self.tab_console, fg_color="transparent")
+        self.frm_cons_ctrl.pack(fill="x", padx=10, pady=5)
+        
+        self.sw_console_mode = ctk.CTkSwitch(self.frm_cons_ctrl, text="Voir Console Pi (SSH)", command=self.toggle_console_mode)
+        self.sw_console_mode.pack(side="left")
+        
+        # Console Output
+        self.txt_console = ctk.CTkTextbox(self.tab_console, font=("Consolas", 10), activate_scrollbars=True)
+        self.txt_console.pack(fill="both", expand=True, padx=10, pady=5)
+        self.txt_console.configure(state="disabled")
+        
+        # Setup Local Logging to Console
+        self.text_handler = TextHandler(self.txt_console)
+        # Formatter
+        self.text_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s', datefmt='%H:%M:%S'))
+        logger.addHandler(self.text_handler)
         
         # === TAB: STREAM ===
         
@@ -718,7 +761,12 @@ class StreamApp(ctk.CTk):
                                        fg_color="green", 
                                        hover_color="darkgreen",
                                        command=self.toggle_stream)
-        self.btn_start.pack(fill="x", padx=10, pady=20)
+        self.btn_start.pack(fill="x", padx=10, pady=(20, 5))
+
+        # Checkbox for Local Auto-Restart
+        self.chk_auto_local = ctk.CTkCheckBox(self.tab_stream, text="Relancer automatiquement si perte signal (>10s)")
+        self.chk_auto_local.pack(anchor="w", padx=10, pady=(5, 20))
+
         
         # === TAB: PI ===
         ctk.CTkLabel(self.tab_pi, text="Configuration SSH", font=("Arial", 14, "bold")).pack(pady=10)
@@ -775,12 +823,35 @@ class StreamApp(ctk.CTk):
         self.ent_path.pack(fill="x", padx=10, pady=5)
         self.ent_path.insert(0, state.pi_path)
         
-        self.btn_pi = ctk.CTkButton(self.tab_pi, text="Lancer Receiver sur Pi (SSH)", 
+        # Buttons Frame
+        self.frm_pi_btns = ctk.CTkFrame(self.tab_pi, fg_color="transparent")
+        self.frm_pi_btns.pack(fill="x", padx=5, pady=20)
+        
+        self.btn_pi = ctk.CTkButton(self.frm_pi_btns, text="Lancer", 
                                     height=40,
                                     fg_color="#D63384",
                                     hover_color="#A81D62",
                                     command=self.launch_pi)
-        self.btn_pi.pack(fill="x", padx=10, pady=20)
+        self.btn_pi.pack(side="left", fill="x", expand=True, padx=5)
+
+        self.btn_stop_pi = ctk.CTkButton(self.frm_pi_btns, text="Stopper", 
+                                    height=40,
+                                    fg_color="#DC3545",
+                                    hover_color="#A71D2A",
+                                    command=self.stop_pi_manual)
+        self.btn_stop_pi.pack(side="left", fill="x", expand=True, padx=5)
+        
+        # Checkbox for Pi Auto-Restart
+        self.chk_auto_pi = ctk.CTkCheckBox(self.tab_pi, text="Relancer automatiquement si perte signal (>10s)")
+        self.chk_auto_pi.pack(anchor="w", padx=10, pady=5)
+
+
+        self.btn_update_pi = ctk.CTkButton(self.tab_pi, text="Mettre à jour le Receiver (SFTP)", 
+                                           height=30,
+                                           fg_color="#0D6EFD",
+                                           hover_color="#0B5ED7",
+                                           command=self.update_pi)
+        self.btn_update_pi.pack(fill="x", padx=10, pady=(0, 20))
         
         # Footer
         self.frm_footer = ctk.CTkFrame(self, fg_color="transparent")
@@ -793,6 +864,9 @@ class StreamApp(ctk.CTk):
         self.lbl_drop.pack(side="right")
         
         # Start Monitor Loop
+        # Start Monitor Loop
+        self.watchdog_loss_counter = 0
+        self.watchdog_cooldown_until = 0
         self.monitor_stats()
 
     def monitor_stats(self):
@@ -915,12 +989,83 @@ class StreamApp(ctk.CTk):
             if pct > 1.0: col = "orange" 
             if pct > 10.0: col = "red"
             self.lbl_drop.configure(text=f"Perte: {pct:.0f}%", text_color=col)
+            
+            # --- WATCHDOG LOGIC ---
+            # 0. Check Cooldown
+            if time.time() < self.watchdog_cooldown_until:
+                remaining = int(self.watchdog_cooldown_until - time.time())
+                if remaining % 5 == 0: logger.info(f"Watchdog: Cooldown ({remaining}s)...")
+                # Reset counter during cooldown to be safe
+                self.watchdog_loss_counter = 0
+            
+            # 1. Check for high loss (indicating dead receiver)
+            # Only trigger if queue buffer is filling up (> 10 items) AND loss is high.
+            # Q size check prevents triggering on simple network lag where packets are still sent but ack is slow (TCP)
+            # Actually, loss_percent is calculated based on DROPPED bytes (buffer full).
+            # So if loss is 100%, it means we are dropping everything aka buffer is full aka receiver is not reading.
+            elif pct >= 99.0:
+                self.watchdog_loss_counter += 1
+                
+                # Dynamic Threshold
+                # If Auto-Restart is ON (Pi or Local): Trigger fast (10s) to retry.
+                # If Auto-Restart is OFF: Wait longer (60s) before giving up and stopping.
+                threshold = 60
+                if self.chk_auto_pi.get() or self.chk_auto_local.get():
+                    threshold = 10
+                
+                if self.watchdog_loss_counter % 5 == 0: 
+                    logger.warning(f"Watchdog: Perte signal détectée ({self.watchdog_loss_counter}/{threshold}s)")
+                
+                if self.watchdog_loss_counter >= threshold:
+                    logger.error(f"Watchdog: TRIGGERED ({threshold}s Loss)")
+                    self.watchdog_loss_counter = 0 # Reset
+                    
+                    # ACTION PRIORITY:
+                    # 1. Restart Pi (if checked) -> Cooldown 30s (Pi Reboot time)
+                    # 2. Restart Local (if checked) -> Cooldown 10s (Fast Retry)
+                    # 3. Just Stop -> No Cooldown
+                    
+                    if self.chk_auto_pi.get():
+                        logger.info("Watchdog Action: Restarting Pi...")
+                        self.watchdog_cooldown_until = time.time() + 30
+                        self.restart_pi()
+                    elif self.chk_auto_local.get():
+                        logger.info("Watchdog Action: Restarting Local...")
+                        self.watchdog_cooldown_until = time.time() + 10
+                        self.restart_local()
+                    else:
+                        logger.info("Watchdog Action: Stopping Stream...")
+                        self.toggle_stream()
+            else:
+                 self.watchdog_loss_counter = 0
+
         else:
+             self.watchdog_loss_counter = 0
              # Stream stopped (Auto-stop or other), reset UI
              if self.btn_start.cget("text") == "STOPPER LE FLUX":
                  self.toggle_stream() # Logic handles UI reset
             
         self.after(1000, self.update_metrics)
+
+
+    # --- SSH HELPER ---
+    def _create_ssh_client(self, ip, user, pwd):
+        """
+        Creates and connects an SSH Client with robust settings.
+        Forces password auth to avoid key/agent issues.
+        """
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        
+        # INCREASED TIMEOUTS & FORCE PASSWORD
+        # banner_timeout=30: Helps if server is slow to greet
+        # timeout=10: Connection timeout
+        # look_for_keys=False: Don't try local keys (avoids auth failure if server wants pwd)
+        # allow_agent=False: Don't use SSH agent
+        client.connect(ip, username=user, password=pwd if pwd else None, 
+                       timeout=10, banner_timeout=30, 
+                       look_for_keys=False, allow_agent=False)
+        return client
 
     def launch_pi(self):
         ip = self.ent_ip.get()
@@ -958,24 +1103,26 @@ class StreamApp(ctk.CTk):
                 # 2. Prepare Command
                 # Robust command construction
                 # Use ~/.Xauthority to be user-agnostic
-                base_cmd = f"export DISPLAY=:0 && export XAUTHORITY=~/.Xauthority && python3 {path}"
+                # ADD LOG REDIRECTION for Remote Console
+                base_cmd = f"export DISPLAY=:0 && export XAUTHORITY=~/.Xauthority && python3 -u {path} > stream_receiver.log 2>&1 &"
+                # Note: 'python3 -u' forces unbuffered output so logs appear instantly
                 
                 final_cmd = base_cmd
-                # If command is python script, append IP
+                # If command is python script, append IP (Wait, args go before redirection)
+                # Correct pattern: python3 -u script.py ARG > log 2>&1 &
                 if path.endswith(".py") and local_ip:
-                     final_cmd = f"{base_cmd} {local_ip}"
+                     final_cmd = f"export DISPLAY=:0 && export XAUTHORITY=~/.Xauthority && python3 -u {path} {local_ip} > stream_receiver.log 2>&1 &"
                 
                 logger.info(f"SSH Connecting to {ip}...")
                 self.lbl_status.configure(text="SSH: Connexion...", text_color="orange")
                 
-                client = paramiko.SSHClient()
-                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                client.connect(ip, username=user, password=pwd if pwd else None, timeout=5)
+                # USE HELPER
+                client = self._create_ssh_client(ip, user, pwd)
                 
                 logger.info(f"SSH Executing: {final_cmd}")
                 self.lbl_status.configure(text="SSH: Exécution...", text_color="blue")
                 
-                stdin, stdout, stderr = client.exec_command(final_cmd, get_pty=True)
+                stdin, stdout, stderr = client.exec_command(final_cmd, get_pty=False) # No PTY for background task
                 
                 # Check for immediate errors (waiting a bit)
                 time.sleep(1.0)
@@ -984,7 +1131,8 @@ class StreamApp(ctk.CTk):
                     out = stdout.channel.recv(1024).decode().strip()
                     if out: logger.info(f"SSH Check: {out}")
                     if "Error" in out or "found" in out or "denied" in out:
-                         messagebox.showerror("Erreur SSH", f"Retour: {out}")
+                         # Safe UI Update
+                         self.after(0, lambda: messagebox.showerror("Erreur SSH", f"Retour: {out}"))
                          self.lbl_status.configure(text="SSH: Erreur (voir logs)", text_color="red")
                          client.close()
                          return
@@ -1001,9 +1149,222 @@ class StreamApp(ctk.CTk):
             except Exception as e:
                 logger.error(f"SSH Fail: {e}")
                 self.lbl_status.configure(text="SSH Erreur!", text_color="red")
-                messagebox.showerror("Erreur Connexion", str(e))
+                self.after(0, lambda: messagebox.showerror("Erreur Connexion", str(e)))
         
         threading.Thread(target=ssh_task, daemon=True).start()
+
+    def stop_pi_manual(self):
+         # Always silent for success, errors still show if silent=False (default behavior kept for errors but success silenced manually in function)
+         # Actually, user said "totalement supprimer toutes les popups". 
+         # So we pass silent=True to be sure? 
+         # Wait, if I pass silent=True, errors are also hidden. User likely wants to see errors.
+         # But wants "Processus arrêté" popup gone.
+         # I commented out the success popup above, so silent=False is fine for errors.
+         self.stop_pi(silent=False)
+
+    def stop_pi(self, silent=False):
+        ip = self.ent_ip.get()
+        user = self.ent_user.get()
+        pwd = self.ent_pass.get()
+        
+        if not ip or not user:
+             if not silent: messagebox.showerror("Erreur", "IP et Utilisateur requis!")
+             return
+
+        def task():
+            try:
+                self.lbl_status.configure(text="SSH: Arrêt en cours...", text_color="orange")
+                client = self._create_ssh_client(ip, user, pwd)
+                
+                # Kill all python instances of stream_receiver
+                # Using pkill -f to match full command line
+                cmd = "pkill -f stream_receiver.py"
+                logger.info(f"SSH Stop: {cmd}")
+                
+                client.exec_command(cmd)
+                time.sleep(0.5)
+                client.close()
+                
+                self.lbl_status.configure(text="SSH: Processus stoppé.", text_color="green")
+                # if not silent: messagebox.showinfo("Succès", "Processus arrêté sur le Raspberry Pi.")
+            except Exception as e:
+                logger.error(f"SSH Stop Error: {e}")
+                self.lbl_status.configure(text="SSH: Erreur Stop", text_color="red")
+                if not silent: 
+                    self.after(0, lambda: messagebox.showerror("Erreur", str(e)))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def update_pi(self):
+        ip = self.ent_ip.get()
+        user = self.ent_user.get()
+        pwd = self.ent_pass.get()
+        remote_path = self.ent_path.get() # e.g. Desktop/stream_receiver.py
+        
+        if not ip or not user: return messagebox.showerror("Erreur", "IP et User requis")
+        
+        # Local File
+        local_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stream_receiver.py")
+        if not os.path.exists(local_file):
+            return messagebox.showerror("Erreur", f"Fichier local introuvable:\n{local_file}")
+            
+        def task():
+            try:
+                self.lbl_status.configure(text="SFTP: Connexion...", text_color="orange")
+                client = self._create_ssh_client(ip, user, pwd)
+                
+                sftp = client.open_sftp()
+                
+                # Resolve Home dir if path is relative
+                # Paramiko SFTP starts at user home usually, ensuring it.
+                # If remote path is absolute, it's fine. If relative, it's relative to home.
+                
+                target_path = remote_path
+                # Basic check for empty path
+                if not target_path or target_path == ".": target_path = "stream_receiver.py"
+                
+                self.lbl_status.configure(text="SFTP: Upload...", text_color="blue")
+                logger.info(f"Uploading {local_file} -> {target_path}")
+                
+                sftp.put(local_file, target_path)
+                sftp.close()
+                client.close()
+                
+                self.lbl_status.configure(text="SFTP: Succès!", text_color="green")
+                self.after(0, lambda: messagebox.showinfo("Mise à jour", f"Fichier envoyé avec succès vers:\n{target_path}"))
+                
+            except Exception as e:
+                logger.error(f"SFTP Error: {e}")
+                self.lbl_status.configure(text="SFTP: Echec", text_color="red")
+                self.after(0, lambda: messagebox.showerror("Erreur Upload", str(e)))
+                
+        threading.Thread(target=task, daemon=True).start()
+
+    def restart_local(self):
+        def task():
+            if state.streaming:
+                logger.info("Restart Local: Stopping...")
+                self.toggle_stream() # Disables streaming
+                time.sleep(2.0)
+            
+            logger.info("Restart Local: Starting...")
+            self.toggle_stream() # Enables streaming
+        
+        threading.Thread(target=task, daemon=True).start()
+
+    def restart_pi(self):
+        # 1. Stop (Silent)
+        self.stop_pi(silent=True)
+        
+        # 2. Wait & Start
+        def task():
+            # Reset Local Stream to clear buffer!
+            if state.streaming:
+                logger.info("Watchdog Action: Resetting Local Stream for clean Start...")
+                # Must call on main thread UI safe? 
+                # toggle_stream modifies UI labels, so yes.
+                # using .after is safer or just call it if we are confident (it uses .configure)
+                # But we are in a thread here? No, restart_pi is called from watchdog (main thread callback in update_metrics)
+                # Wait, update_metrics uses self.after, so it runs on main thread.
+                # So we can call toggle_stream directly here.
+                self.toggle_stream() # Stop
+            
+            self.lbl_status.configure(text="SSH: Redémarrage (Attente 5s)...", text_color="orange")
+            time.sleep(5.0)
+            
+            # launch_pi will auto-start stream if needed
+            # But better to be explicit or let launch_pi handle it?
+            # launch_pi has: if not state.streaming: toggle_stream()
+            # So stopping above is perfect.
+            
+            # We must use self.after to call launch_pi if we want to be 100% thread safe, 
+            # but launch_pi starts a thread itself.
+            # However, this task runs in a thread.
+            # So calling launch_pi (which gets UI values) might be risky?
+            # launch_pi > self.ent_ip.get() (Safe-ish on Tkinter?)
+            # Usually 'get' is safe.
+            
+            # To be absolutely safe, let's schedule launch_pi on main thread
+            self.after(0, self.launch_pi)
+            
+        threading.Thread(target=task, daemon=True).start()
+
+    def toggle_console_mode(self):
+        # Clear Console
+        self.txt_console.configure(state="normal")
+        self.txt_console.delete("1.0", "end")
+        self.txt_console.configure(state="disabled")
+        
+        # Local or Remote?
+        if self.sw_console_mode.get() == 1:
+            # Remote Mode: Disable Local Logs
+            self.text_handler.enabled = False
+            self.start_remote_log()
+        else:
+            # Local Mode: Enable Local Logs
+            self.stop_remote_log()
+            self.text_handler.enabled = True
+             # Re-print local status
+            logger.info("Console Mode: LOCAL")
+            
+    def start_remote_log(self):
+        self.remote_log_running = True
+        
+        ip = self.ent_ip.get()
+        user = self.ent_user.get()
+        pwd = self.ent_pass.get()
+        
+        if not ip or not user:
+             self.txt_console.configure(state="normal")
+             self.txt_console.insert("end", "\n[GUI] ERREUR: Configurer IP/User dans l'onglet Raspberry Pi d'abord.\n")
+             self.txt_console.configure(state="disabled")
+             self.sw_console_mode.deselect()
+             return
+
+        def task():
+            client = None
+            try:
+                self.txt_console.configure(state="normal")
+                self.txt_console.insert("end", f"\n[GUI] Connexion SSH log ({ip})...\n")
+                self.txt_console.configure(state="disabled")
+                
+                client = self._create_ssh_client(ip, user, pwd)
+                
+                stdin, stdout, stderr = client.exec_command("tail -f stream_receiver.log")
+                
+                # Stream logs
+                while self.remote_log_running and self.sw_console_mode.get() == 1:
+                    if stdout.channel.recv_ready():
+                        line = stdout.channel.recv(1024).decode(errors='replace')
+                        if line:
+                             # Append to GUI safely
+                             def append(txt):
+                                 self.txt_console.configure(state="normal")
+                                 self.txt_console.insert("end", txt) # Already has newlines usually
+                                 self.txt_console.see("end")
+                                 self.txt_console.configure(state="disabled")
+                             self.txt_console.after(0, append, line)
+                    else:
+                        time.sleep(0.1)
+                        if stdout.channel.exit_status_ready(): break
+                        
+            except Exception as e:
+                def err_msg(e):
+                     self.txt_console.configure(state="normal")
+                     self.txt_console.insert("end", f"\n[GUI] Erreur SSH Log: {e}\n")
+                     self.txt_console.configure(state="disabled")
+                self.txt_console.after(0, err_msg, e)
+            finally:
+                if client: client.close()
+                self.remote_log_running = False
+        
+        threading.Thread(target=task, daemon=True).start()
+
+    def stop_remote_log(self):
+        self.remote_log_running = False
+        self.txt_console.configure(state="normal")
+        self.txt_console.insert("end", "\n[GUI] Retour Local Log.\n")
+        self.txt_console.configure(state="disabled")
 
 if __name__ == "__main__":
     # Priority Boost

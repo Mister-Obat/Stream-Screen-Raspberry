@@ -24,6 +24,9 @@ Il permet d'ajouter un écran virtuel à votre PC, idéal pour étendre votre bu
 ## Fonctionnalités Clés
 
 *   **Architecture "Zero-Copy"** : Capture DXCam directe vers Encodeur GPU.
+*   **Auto-Recovery (Watchdog)** : Détection intelligente de perte de signal et redémarrage automatique synchronisé (PC + Pi).
+*   **Console de Supervision** : Visualisez les logs du PC et du Raspberry Pi (via SSH) en temps réel directement dans l'app.
+*   **Contrôle Total SSH** : Lancez, arrêtez ou mettez à jour le script sur le Pi d'un simple clic.
 *   **Encodage H.264 Hardware** : Compatible NVIDIA (NVENC) et AMD (AMF).
 *   **Smart Refresh (Nouveau)** : Déduplication d'images (0% bande passante sur écrans statiques).
 *   **Contrôle CPU Nul** : L'ordinateur reste 100% disponible (Priorité Haute).
@@ -44,6 +47,9 @@ L'application offre un contrôle total sur le flux :
     *   **10-20%** : Mode "Haoe Fréquence" (Gaming/Bureau).
     *   **50%+** : Mode "Tampon" (Films/Vidéos) pour absorber les saccades réseau.
 *   **Smart Refresh** : Si l'image est statique, le débit tombe à 0. Un "heartbeat" est envoyé toutes les 0.5s pour maintenir la connexion.
+*   **Mode Console** :
+    *   **Local** : Affiche les logs de l'application PC (FPS, Bitrate, Erreurs).
+    *   **Remote (SSH)** : Affiche en direct les logs du Raspberry Pi pour un diagnostic instantané.
 
 ## Mise en Route
 
