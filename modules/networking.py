@@ -124,8 +124,13 @@ def rtsp_publisher_loop():
              
              # 4. STREAM LOOP
              buffer_rtsp.clear()
+             
+             # Timestamp Management
+             pts_offset = 0
+             last_raw_pts = -1
+             last_mux_dts = -1 # Track output to prevent rollback
+             
              # [FIX] Force immediate Keyframe (IDR) to prevent initial freeze
-             # We just cleared the buffer, so the first packet sent MUST be an IDR.
              if state.encoder: state.encoder.force_next_keyframe()
 
              error_count = 0
@@ -135,29 +140,38 @@ def rtsp_publisher_loop():
                 if packet is None: continue
                 
                 try:
-                    # [FIX] Manual Timestamp Rescaling (PyAV Compatibility)
-                    # packet.rescale_timestamp() is not available in some versions.
-                    # Formula: PTS_new = PTS_old * 90000 / FPS
-                    
                     # Assign stream first so PyAV knows the context
                     packet.stream = stream
                     
                     if packet.pts is None: packet.pts = 0
                     
-                    # Calculate strictly (avoid float drift if possible, but int casting is usually fine for this scale)
-                    # Encoder Timebase: 1/FPS
-                    # Stream Timebase: 1/90000
-                    scale_factor = 90000 / state.fps
-                    new_pts = int(packet.pts * scale_factor)
+                    # [FIX 1] Monotonic Input Detection (Encoder Reset)
+                    if packet.pts < last_raw_pts:
+                        pts_offset += (last_raw_pts + 100) # Small gap to be safe
+                        logger.info(f"RTSP: Encoder Reset Detected. Offset={pts_offset}")
+                    last_raw_pts = packet.pts
                     
-                    packet.pts = new_pts
-                    packet.dts = new_pts # Force DTS=PTS (No B-frames)
+                    # [FIX 2] Strict Output Monotonicity (Avoid Errno 22)
+                    # We calculate target PTS, but we MUST ensure it is > last sent DTS
+                    
+                    scale_factor = 90000 / state.fps
+                    target_pts = int((packet.pts + pts_offset) * scale_factor)
+                    
+                    if target_pts <= last_mux_dts:
+                        target_pts = last_mux_dts + 1
+                    
+                    packet.pts = target_pts
+                    packet.dts = target_pts
                     
                     container.mux(packet)
+                    last_mux_dts = target_pts # Update last valid
+                    
                     error_count = 0
                 except Exception as e:
                     # Broken pipe or server disconnect
                     logger.warning(f"RTSP Mux Fail: {e}")
+                    error_count += 1
+                    if error_count > 10: raise e # Reset loop if stuck
                     error_count += 1
                     if error_count > 10: raise e # Force reconnect
             

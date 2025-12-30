@@ -84,8 +84,14 @@ def stream_thread_func():
     dropped_rtsp_total = 0
     state.loss_percent = 0.0
     
-    last_send_time = time.time()
+    state.loss_percent = 0.0
     
+    last_send_time = time.time()
+    last_log_time = time.time() 
+    
+    # FPS Limiter Vars
+    loop_start_time = time.perf_counter()
+
     # Clear Buffers
     buffer_tcp.clear()
     buffer_rtsp.clear()
@@ -208,6 +214,7 @@ def stream_thread_func():
         
         try:
             # T1: Capture
+            t0_start = time.time()
             t1 = time.time()
             if current_backend == "DXCam" and dxcam_camera:
                 raw = dxcam_camera.get_latest_frame()
@@ -261,22 +268,25 @@ def stream_thread_func():
                 if not frame_changed and not cursor_changed:
                     # Nothing moved!
                     
-                    # [FIX - HYBRID MODE]
-                    # If RTSP is active, we MUST maintain a constant stream of frames (CFR)
-                    # to satisfy the Encoder's GOP (Keyframe interval) requirements.
-                    # If we skip encoding, the IDR frame comes too late (e.g. after 30s instead of 1s),
-                    # causing HLS/WebRTC to buffer indefinitely (Frozen Frame).
-                    
                     if state.rtsp_mode:
-                        # Force encode even if static
+                        # RTSP requires CFR
                         pass 
                     else:
-                        # TCP/Pi Mode: We can aggressively save bandwidth
-                        # prevent connection timeout (Heartbeat) - Send at least every 0.5s
-                        if time.time() - last_send_time < 0.5:
-                            # Sleep slightly to prevent CPU spin
+                        # TCP/Pi Mode: Use PING Heartbeat
+                        time_since_last = time.time() - last_send_time
+                        
+                        if time_since_last < 0.5:
                             time.sleep(0.01)
                             continue
+                        
+                        # SEND HEARTBEAT (PING)
+                        # We push directly to TCP buffer
+                        if conn is not None:
+                             buffer_tcp.put(b'PING')
+                             last_send_time = time.time()
+                             logger.info("Sent PING") # Verbose for Debug
+                        
+                        continue
 
                 # Update Last State
                 last_frame_data = frame_bgr.copy() # Copy is needed as frame_bgr is mutable
@@ -304,30 +314,48 @@ def stream_thread_func():
                 full_rtsp = state.rtsp_mode and buffer_rtsp.q.qsize() > user_threshold
                 
                 # STRATEGY 1: "Snap-to-Live" (Low Latency Mode < 20%)
-                # If we are lagging, we BURN the buffer but only if user wants low latency.
+                # If we are lagging, we BURN the buffer.
+                # [FIX] "Direct à tout prix" Logic: If latency slider is very low (< 5%), 
+                # we tolerate ZERO buffer. Any queue > 0 is treated as lag.
+                
+                real_buffer_limit = user_threshold
+                if state.latency_value < 5: 
+                    real_buffer_limit = 0 # STRICT Mode
+                
+                full_tcp = conn is not None and buffer_tcp.q.qsize() > real_buffer_limit
+                full_rtsp = state.rtsp_mode and buffer_rtsp.q.qsize() > real_buffer_limit
+                
                 if (full_tcp or full_rtsp) and state.latency_value < 20:
                      if full_tcp: 
-                         with buffer_tcp.q.mutex: buffer_tcp.q.queue.clear()
+                         with buffer_tcp.q.mutex: 
+                             q_len = len(buffer_tcp.q.queue)
+                             buffer_tcp.q.queue.clear()
+                             dropped_tcp_total += q_len
+                         logger.debug(f"Snap-to-Live TCP: Flushed {q_len} frames!")
                          
                      # [FIX] Do NOT clear RTSP buffer blindly.
-                     # Clearing RTSP queue breaks the MPEG-TS/RTSP continuity and causes freezes.
-                     # We only drop if it's EXTREMELY full (emergency only), not for micro-adjustments.
+                     # Reverted strict mode as it causes jitter for local MediaMTX connection.
+                     # We only drop if it's EXTREMELY full (emergency only).
                      if full_rtsp and buffer_rtsp.q.qsize() > state.fps * 2: # Only if > 2 seconds lag
-                         with buffer_rtsp.q.mutex: buffer_rtsp.q.queue.clear()
-                         logger.warning(f"Snap-to-Live RTSP: Flushed EMERGENCY (>2s lag)")
+                         with buffer_rtsp.q.mutex: 
+                             q_len = len(buffer_rtsp.q.queue)
+                             buffer_rtsp.q.queue.clear()
+                             dropped_rtsp_total += q_len
+                         logger.warning(f"Snap-to-Live RTSP: Flushed EMERGENCY {q_len} frames (>2s lag)")
                          if encoder: encoder.force_next_keyframe()
                      elif full_tcp:
-                        # If we flushed TCP, we might want a keyframe too
                         if encoder: encoder.force_next_keyframe()
-                        logger.warning(f"Snap-to-Live TCP: Flushed!")
                      
                      # We do NOT drop this current frame, we want to encode it as the new IDR!
                      
                 # STRATEGY 2: "Smooth Drop" (Quality Mode >= 20%)
                 # Just skip this frame to allow buffer to drain naturally.
                 elif (full_tcp or full_rtsp):
+                    if full_tcp: dropped_tcp_total += 1
+                    if full_rtsp: dropped_rtsp_total += 1
                     frames_total_sec += 1 
-                    time.sleep(0.005) 
+                    
+                    # We throttle at start of loop, so just continue
                     continue # Skip Encoding
 
                 # ENCODE (H.264)
@@ -344,11 +372,13 @@ def stream_thread_func():
                 
                 # 1. RTSP Queue
                 if state.rtsp_mode:
-                    for pkt in packets: buffer_rtsp.put(pkt)
+                    for pkt in packets: 
+                        if not buffer_rtsp.put(pkt): dropped_rtsp_total += 1
                 
                 # 2. TCP Queue
                 if conn is not None:
-                    for pkt in packets: buffer_tcp.put(bytes(pkt))
+                    for pkt in packets: 
+                        if not buffer_tcp.put(bytes(pkt)): dropped_tcp_total += 1
                 
                 # Only add byte count if at least one sent? 
                 # Simplification: just add it, byte count is for source throughput estimation.
@@ -371,9 +401,9 @@ def stream_thread_func():
                         loss_rtsp_pct = (dropped_rtsp_total / frames_total_sec) * 100.0
                         
                     # State Update
-                    state.loss_tcp = loss_tcp_pct
-                    state.loss_rtsp = loss_rtsp_pct
-                    state.loss_percent = max(loss_tcp_pct, loss_rtsp_pct) # Max for watchdog
+                    state.loss_tcp = min(100.0, loss_tcp_pct)
+                    state.loss_rtsp = min(100.0, loss_rtsp_pct)
+                    state.loss_percent = min(100.0, max(loss_tcp_pct, loss_rtsp_pct))
                          
                     # Reset Window
                     frames_total_sec = 0
@@ -383,11 +413,15 @@ def stream_thread_func():
                     # Profiling Log
                     cap_ms = (t2 - t1) * 1000
                     proc_ms = (t3 - t2) * 1000
-                    enc_ms = (t4 - t3) * 1000
-                    total_ms = (t4 - t1) * 1000
-                    logger.info(f"[{current_backend}] FPS:{state.current_fps} | Mbps:{state.current_mbps:.1f} | Q_TCP:{buffer_tcp.q.qsize()} Q_RTSP:{buffer_rtsp.q.qsize()} | Loss TCP:{loss_tcp_pct:.1f}% RTSP:{loss_rtsp_pct:.1f}% | Times(ms) Cap:{cap_ms:.1f} Proc:{proc_ms:.1f} Enc:{enc_ms:.1f} Tot:{total_ms:.1f}")
-                    
-                    # [Previous Auto-Fallback Remove]
+                    if t_now - last_log_time >= 5.0:
+                        capture_mode = "DXCAM" if state.backend == "DXCam" else "MSS"
+                        
+                        # [DEBUG] Show Target FPS vs Actual
+                        logger.info(f"[{capture_mode}] Target:{state.fps} | FPS:{state.current_fps} | Mbps:{state.current_mbps:.1f} | " 
+                                    f"Q_TCP:{buffer_tcp.q.qsize()} Q_RTSP:{buffer_rtsp.q.qsize()} | "
+                                    f"Loss TCP:{state.loss_tcp:.1f}% RTSP:{state.loss_rtsp:.1f}% | "
+                                    f"Times(ms) Cap:{t1-t0_start:.1f} Proc:{t2-t1:.1f} Enc:{t4-t3:.1f} Tot:{t4-t0_start:.1f}")
+                        last_log_time = t_now
                     # Logic block was removed here.
                     
                     byte_count = 0
@@ -397,6 +431,14 @@ def stream_thread_func():
         except Exception as e:
             logger.error(f"Stream Loop Error: {e}")
             pass
+            
+        # [FIX] FPS Limiter at END of loop to minimize input latency
+        proc_duration = time.perf_counter() - loop_start_time
+        target_dt = 1.0 / max(1, state.fps)
+        if proc_duration < target_dt:
+             time.sleep(target_dt - proc_duration)
+        
+        loop_start_time = time.perf_counter()
         
         # FPS Cap
         dt = time.time() - t_start

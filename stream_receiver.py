@@ -63,12 +63,17 @@ def discover_server():
 import queue
 
 # --- OPTIMIZATION: JITTER BUFFER ---
-packet_queue = queue.Queue(maxsize=60) # ~1 sec buffer at 60fps
+packet_queue = queue.Queue(maxsize=4) # STRICT: Only 4 frames buffer (~60ms @ 60fps)
 
 def receive_thread_func(sock):
     """Producer: Reads socket, pushes raw packets to queue."""
-    global running
+    global running, last_packet_time # [FIX] Ensure proper scope
     print("[NET] Reception Thread Started.")
+    
+    # [FIX] Reduce OS TCP Buffer to minimize "ghost" latency
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32 * 1024) # 32KB
+    except: pass
     
     def recv_n(n):
         buf = b''
@@ -78,8 +83,6 @@ def receive_thread_func(sock):
                 if not c: return None
                 buf += c
             except socket.timeout:
-                # Timeout is normal if sender is silent (heartbeat needed?)
-                # We just check 'running' and retry
                 if not running: raise
                 continue 
             except Exception: 
@@ -91,7 +94,7 @@ def receive_thread_func(sock):
             # 1. Read Header [Size (4)]
             try:
                 h = recv_n(4)
-            except Exception: # Timeout or Error propagated
+            except Exception: 
                 break
                 
             if not h: break
@@ -106,8 +109,13 @@ def receive_thread_func(sock):
             data = recv_n(size)
             if not data: break
             
-            # Update Timeout Timer
-            global last_packet_time
+            # Handle PING (Heartbeat)
+            if data == b'PING':
+                last_packet_time = time.time()
+                # print("[PING] Heartbeat ack") 
+                continue
+            
+            # Update Timeout Timer (Video Data)
             last_packet_time = time.time()
             
             # 3. Push to Queue
@@ -146,6 +154,9 @@ def decode_thread_func():
                 data = packet_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
+            
+            # PING Check (Just in case it slipped through)
+            if data == b'PING': continue
             
             # Decode
             try:
@@ -211,7 +222,7 @@ def main():
     global running, latest_frame
     
     print("="*40)
-    print(" STREAM RECEIVER v2.2")
+    print(" STREAM RECEIVER v2.4 (Ultra Low Latency + 5min Timeout)")
     # 1. Discovery & Arg Parsing
     target_ip = None
     infinite_retry = False
@@ -327,8 +338,9 @@ def main():
             dt = clock.tick(60)
             
             # CHECK TIMEOUT (Anti-Freeze)
-            if time.time() - last_packet_time > 20.0:
-                 print("[TIMEOUT] Pas de données depuis 20s. Fin du stream.")
+            # Increased to 300s (5 min) to be safe, relying on PING.
+            if time.time() - last_packet_time > 300.0:
+                 print("[TIMEOUT] Pas de données depuis 5 minutes. Fin du stream.")
                  running = False
                  # This triggers loop exit -> main outer loop will decide to Exit or Reconnect
             

@@ -708,9 +708,9 @@ class StreamApp(ctk.CTk):
             if l_tcp > 1.0 or l_rtsp > 1.0: col = "orange" 
             if l_tcp > 10.0 or l_rtsp > 10.0: col = "red"
             
-            txt = f"Perte: TCP {l_tcp:.0f}%"
+            txt = f"Perte: RASP {l_tcp:.0f}%"
             if state.rtsp_mode:
-                 txt += f" | RTSP {l_rtsp:.0f}%"
+                 txt += f" | WEBRTC {l_rtsp:.0f}%"
             
             self.lbl_drop.configure(text=txt, text_color=col)
             
