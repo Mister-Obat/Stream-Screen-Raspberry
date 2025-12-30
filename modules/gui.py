@@ -31,6 +31,9 @@ class StreamApp(ctk.CTk):
         self.title("Stream Screen")
         self.geometry("500x800")
         
+        # Shutdown Protocol
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
         # --- DESIGN SYSTEM "MIDNIGHT INDIGO" ---
         ctk.set_appearance_mode("Dark")
         ctk.set_default_color_theme("dark-blue")
@@ -470,6 +473,17 @@ class StreamApp(ctk.CTk):
             client_status = "Connecté" if state.client_connected else "En attente..."
             msg = f"Status: En Ligne ({client_status}) | {state.current_fps} FPS | {state.current_mbps:.2f} Mbps"
             color = "green" if state.client_connected else "orange"
+            
+            # --- BUTTON STATE MANAGEMENT (STICKY) ---
+            if state.client_connected:
+                 # Priority 1: CONNECTED
+                 self.btn_launch_pi.configure(text="CONNECTÉ", state="disabled", fg_color="#1F2937") # Grey
+            elif hasattr(self, "failure_start_time") and self.failure_start_time is not None and self.chk_auto_pi.get():
+                 # Priority 2: AUTO-RECONNECTING
+                 self.btn_launch_pi.configure(text="RECONNEXION...", state="disabled", fg_color="#7c4d08") # Dark Orange
+            elif self.btn_launch_pi.cget("text") in ["CONNECTÉ", "RECONNEXION..."]:
+                 # Priority 3: Reset to Default if we fell out of other states
+                 self.btn_launch_pi.configure(text="LANCER", state="normal", fg_color="#0D2616")
         else:
             msg = "Status: Arrêté"
             color = "gray"
@@ -611,7 +625,9 @@ class StreamApp(ctk.CTk):
     def toggle_rtsp_mode(self):
         # Logic: If turning ON
         if self.sw_rtsp.get():
-            state.rtsp_mode = True
+            # [FIX] Do NOT set state.rtsp_mode = True yet!
+            # We wait for server to actually start to avoid race condition with stream thread.
+            pass
             
             # Create Modal
             self.loading_win = ctk.CTkToplevel(self)
@@ -680,6 +696,9 @@ class StreamApp(ctk.CTk):
                 
             time.sleep(1.0) # Let it connect
             
+            # [FIX] NOW enable the mode, so the Publisher Thread starts
+            state.rtsp_mode = True
+            
             # SUCCESS
             self.after(0, self._rtsp_startup_success)
             
@@ -708,9 +727,7 @@ class StreamApp(ctk.CTk):
             if l_tcp > 1.0 or l_rtsp > 1.0: col = "orange" 
             if l_tcp > 10.0 or l_rtsp > 10.0: col = "red"
             
-            txt = f"Perte: RASP {l_tcp:.0f}%"
-            if state.rtsp_mode:
-                 txt += f" | WEBRTC {l_rtsp:.0f}%"
+            txt = f"Perte: {l_tcp:.0f}%"
             
             self.lbl_drop.configure(text=txt, text_color=col)
             
@@ -723,13 +740,21 @@ class StreamApp(ctk.CTk):
                 # Reset counter during cooldown to be safe
                 self.watchdog_loss_counter = 0
             
-            # 1. Check for high loss (indicating dead receiver)
+            # 1. Check for high loss OR Disconnection (if Auto-Restart is ON)
+            is_disconnected_safety = False
+            if self.chk_auto_pi.get() and not state.client_connected and state.streaming:
+                 is_disconnected_safety = True
             elif pct >= 99.0:
+                 is_disconnected_safety = True
+
+            if is_disconnected_safety:
                 self.watchdog_loss_counter += 1
                 
-                # Global Failure Logic (Persists across re-launches via self)
-                if not hasattr(self, "global_failure_timer"): self.global_failure_timer = 0
-                self.global_failure_timer += 1
+                # Global Failure Logic (Timestamp based)
+                if not hasattr(self, "failure_start_time") or self.failure_start_time is None:
+                     self.failure_start_time = time.time()
+                
+                elapsed_failure = time.time() - self.failure_start_time
                 
                 # Limits
                 TIME_LIMIT = 120 # 2 minutes by default
@@ -737,25 +762,19 @@ class StreamApp(ctk.CTk):
                     TIME_LIMIT = 7200 # 2 Hours Max Safety
                     
                 # Have we exceeded total time?
-                if self.global_failure_timer > TIME_LIMIT:
+                if elapsed_failure > TIME_LIMIT:
                     logger.error("Watchdog: Abandon (Limite de temps de 2h atteinte).")
                     self.toggle_stream() # Stop Local
-                    
-                    # Safety Kill for Pi
-                    if self.chk_auto_pi.get():
-                        logger.info("Watchdog: Killing Pi process (Safety Timeout)...")
-                        self.stop_pi(silent=True)
-
+                    self.stop_pi(silent=True) # Ensure Pi is stopped
                     self.watchdog_loss_counter = 0
-                    self.global_failure_timer = 0
+                    self.failure_start_time = None
                     return
 
                 # Retry Interval (Every 10s)
-                # Logic: If we are in "Loss" state, we trigger every 10s.
                 RETRY_INTERVAL = 10
                 
                 if self.watchdog_loss_counter >= RETRY_INTERVAL:
-                    logger.warning(f"Watchdog: Tentative de reconnexion... (Global: {self.global_failure_timer}s)")
+                    logger.warning(f"Watchdog: Tentative de reconnexion... (Global: {int(elapsed_failure)}s)")
                     
                     if state.rtsp_mode:
                         logger.info("Watchdog: RTSP mode, disabling watchdog trigger.")
@@ -763,7 +782,6 @@ class StreamApp(ctk.CTk):
                     else:
                         state.watchdog_triggered = True
                         
-                        # Trigger action based on current state
                         if state.streaming and not state.pi_streaming: 
                             logger.info("Watchdog Action: Restarting Local...")
                             self.restart_local()
@@ -774,22 +792,38 @@ class StreamApp(ctk.CTk):
                             logger.info("Watchdog Action: Starting Receiver...")
                             self.launch_pi()
                         
-                        # Reset Interval Counter (but NOT global timer)
+                        # Reset Interval Counter
                         self.watchdog_loss_counter = 0 
+                        self.watchdog_cooldown_until = time.time() + 15.0 
 
             else:
                  # Success! Reset counters
                  self.watchdog_loss_counter = 0
-                 self.global_failure_timer = 0
-
+                 # Only reset failure timer if we are truly connected (or logic suggests success)
+                 self.failure_start_time = None
+                 
         else:
              self.watchdog_loss_counter = 0
-             self.global_failure_timer = 0
+             # Only reset failure timer if we are NOT in auto-restart loop
+             # How do we know? If 'reconnecting' button state?
+             # Simplest: If the user manually stopped, btn text is LANCER or STOPPER (but streaming=False)
+             # If restart_pi stopped it, we want to KEEP the timer.
+             if not self.chk_auto_pi.get():
+                 self.failure_start_time = None
+             # If we are Auto-Pi, we keep the timer until Connect OR Manual Full Stop?
+             # Manual Stop calls toggle_stream -> state.streaming=False.
+             # We can reset it in toggle_stream? No, restart_pi calls toggle_stream.
+             
+             # If streaming is False, we can't really track failure unless we check the button state?
+             # If button says "RECONNEXION...", keep timer.
+             btn_text = self.btn_launch_pi.cget("text")
+             if btn_text != "RECONNEXION...":
+                  self.failure_start_time = None
              # Stream stopped (Auto-stop or other), reset UI
              if self.btn_start.cget("text") == "STOPPER LE FLUX":
                  self.toggle_stream() # Logic handles UI reset
             
-        self.after(1000, self.update_metrics)
+        self.after(500, self.update_metrics)
 
 
     # --- SSH HELPER ---
@@ -821,8 +855,14 @@ class StreamApp(ctk.CTk):
             messagebox.showerror("Erreur", "IP et Utilisateur requis!")
             print("ERROR: Missing IP or User")
             return
+            
+        self.btn_launch_pi.configure(state="disabled", text="CONNEXION...")
         
         self.save_config()
+        
+        # Mark as Pi Streaming for Watchdog
+        state.pi_streaming = True
+        logger.info("GUI: Pi Streaming Mode ACTIVE")
 
         # AUTO-START STREAM IF NEEDED
         async_start = False
@@ -844,11 +884,35 @@ class StreamApp(ctk.CTk):
         
         
         def ssh_task():
+            client = None
             try:
-                # 1. Get Local IP to help Receiver
-                local_ip = ""
+                # 0. CONNECT SSH FIRST
+                self.after(0, lambda: self.lbl_status.configure(text="SSH: Connexion...", text_color="orange"))
+                # Set Cooldown to prevent watchdog interference
+                self.watchdog_cooldown_until = time.time() + 20.0
+                try:
+                    client = self._create_ssh_client(ip, user, pwd)
+                except Exception as e:
+                     raise Exception(f"Echec Connexion SSH: {e}")
+
+                # 1. KILL PREVIOUS (Dynamic Name)
+                target_script = os.path.basename(path)
+                if not target_script: target_script = "stream_receiver.py"
                 
-                # CHECK FORCE IP
+                kill_cmds = [f"pkill -9 -f {target_script}"]
+                if target_script != "stream_receiver.py":
+                    kill_cmds.append("pkill -9 -f stream_receiver.py") # Legacy safety
+                
+                for cmd in kill_cmds:
+                    try:
+                        logger.info(f"Cleanup: {cmd}")
+                        client.exec_command(cmd)
+                    except: pass
+                
+                time.sleep(1.0) # Wait for cleanup
+
+                # 2. Get Local IP (Network Helper)
+                local_ip = ""
                 if self.chk_force_ip.get():
                      local_ip = self.ent_force_ip.get()
                      logger.info(f"Using Forced Local IP: {local_ip}")
@@ -857,122 +921,63 @@ class StreamApp(ctk.CTk):
                     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                     s.settimeout(2.0)
                     try:
-                        # Method A: Connect to Pi (Best)
-                        logger.info(f"Method A: Connecting to Pi IP {ip}...")
                         s.connect((ip, 22)) 
                         local_ip = s.getsockname()[0]
-                        logger.info(f"Method A Success: {local_ip}")
-                    except Exception as eA: 
-                        logger.warning(f"Method A Failed: {eA}")
-                        # Method B: Connect to Public DNS (Google)
+                    except:
                         try:
-                            logger.info("Method B: Connecting to 8.8.8.8...")
-                            s.connect(("8.8.8.8", 80))
-                            local_ip = s.getsockname()[0]
-                            logger.info(f"Method B Success: {local_ip}")
-                        except Exception as eB:
-                            logger.warning(f"Method B Failed: {eB}")
-                            # Method C: Hostname
-                            try: 
-                                local_ip = socket.gethostbyname(socket.gethostname())
-                                logger.info(f"Method C (Hostname): {local_ip}")
-                            except: pass
+                             s.connect(("8.8.8.8", 80))
+                             local_ip = s.getsockname()[0]
+                        except: pass
                     finally: s.close()
 
                 if not local_ip:
-                     logger.error("CRITICAL: Failed to detect ANY local IP. Receiver will likely timeout.")
-
-                # 2. Kill previous instances explicitly first
-                # OPTIMIZATION: Only pkill 1 out of 3 times to spare Pi CPU/SSH time
-                if not hasattr(self, "pi_launch_count"): self.pi_launch_count = 0
-                self.pi_launch_count += 1
-                
-                do_kill = True
-                # "1 fois sur 3" -> 1st time (1), 4th time (4), etc.
-                if self.pi_launch_count > 1 and (self.pi_launch_count - 1) % 3 != 0:
-                     do_kill = False
-                     
-                if do_kill:
-                    try:
-                        logger.info(f"Killing previous remote instances... (Launch #{self.pi_launch_count}: KILL)")
-                        client.exec_command("pkill -9 -f stream_receiver.py")
-                        time.sleep(1.0) # Wait for cleanup
-                    except: pass
-                else:
-                    logger.info(f"Skipping kill to speed up retry... (Launch #{self.pi_launch_count}: SKIP)")
+                     logger.error("CRITICAL: Failed to detect ANY local IP.")
 
                 # 3. Prepare Command
-                # Use >> (append) to keep file alive.
-                # Added 'echo' to verify command execution in logs
-                # Removed pkill from chain as it's done above
                 base_cmd = f"echo '--- LAUNCHING PYTHON SCRIPT ---' >> stream_receiver.log; export DISPLAY=:0 && export XAUTHORITY=~/.Xauthority && python3 -u {path} >> stream_receiver.log 2>&1 &"
-                
                 final_cmd = base_cmd
                 
-                # 4. Add Arguments
-                # If script ends with .py, pass local_ip for reverse connection
+                # Add Arguments
                 pass_arg = path.endswith(".py")
                 if not pass_arg:
                     pass_arg = self.check_file_is_python(path)
-                    if not pass_arg:
-                        logger.warning(f"Not passing IP arg: Path '{path}' does not end with .py")
 
-                # Prepare flags
                 retry_flag = ""
-                # SMART CONFIG: Enable ZOMBIE MODE if Pi Auto-Restart is checked.
-                is_zombie_requested = self.chk_auto_pi.get()
-                
-                if is_zombie_requested:
+                if self.chk_auto_pi.get():
                      retry_flag = " --retry"
-                     logger.info("Auto-Retry: ENABLED (Zombie Mode Active via UI)")
-                else:
-                     logger.info("Auto-Retry: DISABLED (No Auto-Restart checked)")
-
+                
                 if pass_arg:
                      final_cmd = f"echo '--- LAUNCHING PYTHON SCRIPT (ARG) ---' >> stream_receiver.log; export DISPLAY=:0 && export XAUTHORITY=~/.Xauthority && python3 -u {path} {local_ip}{retry_flag} >> stream_receiver.log 2>&1 &"
-                else:
-                     logger.warning("Using Base Cmd (No IP arg) -> Receiver will use Auto-Discovery.")
-                
-                logger.info(f"FINAL CMD: || {final_cmd} ||")
-                
-                logger.info(f"SSH Connecting to {ip}...")
-                self.lbl_status.configure(text="SSH: Connexion...", text_color="orange")
-                
-                # USE HELPER
-                client = self._create_ssh_client(ip, user, pwd)
                 
                 logger.info(f"SSH Executing: {final_cmd}")
-                self.lbl_status.configure(text="SSH: Exécution...", text_color="blue")
+                self.after(0, lambda: self.lbl_status.configure(text="SSH: Lancement...", text_color="blue"))
                 
-                stdin, stdout, stderr = client.exec_command(final_cmd, get_pty=False) # No PTY for background task
+                stdin, stdout, stderr = client.exec_command(final_cmd, get_pty=False)
                 
-                # Check for immediate errors (waiting a bit)
-                time.sleep(1.0)
-                
+                # Check for immediate errors
+                time.sleep(1.5)
                 if stdout.channel.recv_ready():
                     out = stdout.channel.recv(1024).decode().strip()
-                    if out: logger.info(f"SSH Check: {out}")
-                    if "Error" in out or "found" in out or "denied" in out:
-                         # Safe UI Update
-                         self.after(0, lambda: messagebox.showerror("Erreur SSH", f"Retour: {out}"))
-                         self.lbl_status.configure(text="SSH: Erreur (voir logs)", text_color="red")
-                         client.close()
-                         return
+                    if out and ("Error" in out or "found" in out or "denied" in out):
+                         raise Exception(f"Retour SSH: {out}")
 
-                self.lbl_status.configure(text="SSH: Lancé avec succès!", text_color="green")
-                # Warning: Closing client kills the process if not persistent. 
-                # Keeping it open or letting it detach is tricky. 
-                # For now, we keep the object but the thread ends. The GC might close it.
-                # Let's detach properly or keep log open?
-                # User wants 'simple'.
-                # Use nohup trick if we want to close connection
-                # But 'exec_command' blocks until channel closed? No, it returns streams.
+                self.after(0, lambda: self.lbl_status.configure(text="SSH: Succès!", text_color="green"))
                 
             except Exception as e:
                 logger.error(f"SSH Fail: {e}")
-                self.lbl_status.configure(text="SSH Erreur!", text_color="red")
+                self.after(0, lambda: self.lbl_status.configure(text="SSH: Erreur!", text_color="red"))
+
                 self.after(0, lambda: messagebox.showerror("Erreur Connexion", str(e)))
-        
+                # ON FAILURE: Reset Button
+                self.after(0, lambda: self.btn_launch_pi.configure(state="normal", text="LANCER"))
+            
+            finally:
+                # SUCCESS: Leave button Disabled (User wants confirmation "Connected/Running")
+                # ERROR: Reset button to "LANCER"
+                # To differentiate, we check if we reached end of try block logic successfully?
+                # Actually, if we are in finally, exception might have happened.
+                pass
+                
         threading.Thread(target=ssh_task, daemon=True).start()
 
 
@@ -995,6 +1000,10 @@ class StreamApp(ctk.CTk):
              if not silent: messagebox.showerror("Erreur", "IP et Utilisateur requis!")
              return
 
+        # Mark as NOT Pi Streaming
+        state.pi_streaming = False
+        logger.info("GUI: Pi Streaming Mode DISABLED")
+
         def task():
             try:
                 self.lbl_status.configure(text="SSH: Arrêt en cours...", text_color="orange")
@@ -1010,6 +1019,8 @@ class StreamApp(ctk.CTk):
                 client.close()
                 
                 self.lbl_status.configure(text="SSH: Processus stoppé.", text_color="green")
+                # Reset Launch Button
+                self.after(0, lambda: self.btn_launch_pi.configure(state="normal", text="LANCER", fg_color="#0D2616"))
                 # if not silent: messagebox.showinfo("Succès", "Processus arrêté sur le Raspberry Pi.")
             except Exception as e:
                 logger.error(f"SSH Stop Error: {e}")
@@ -1221,3 +1232,29 @@ class StreamApp(ctk.CTk):
            s.close()
            return ip
         except: return "127.0.0.1"
+
+    def on_closing(self):
+        logger.info("Shutdown initiated...")
+        
+        # 1. Stop Streaming Flags (Stops Threads)
+        state.streaming = False
+        state.rtsp_mode = False
+        
+        # 2. Stop Pi (SSH) - Async or fire and forget?
+        # Better to be safe and try to stop it to avoid zombies
+        if state.client_connected:
+             self.stop_pi(silent=True)
+        
+        # 3. Stop RTSP Server
+        if state.rtsp_server.is_running:
+            logger.info("Shutdown: Killing MediaMTX...")
+            state.rtsp_server.stop()
+            
+        # 4. Save Config
+        self.save_config()
+        
+        # 5. Kill App
+        logger.info("Shutdown: Destroying Window...")
+        self.destroy()
+        logger.info("Shutdown: Complete.")
+        os._exit(0) # Force Kill to prevent hanging threads

@@ -178,10 +178,18 @@ def rtsp_publisher_loop():
              if container: container.close()
             
         except Exception as e:
-            logger.error(f"RTSP Loop Critical Error: {e}. Resetting in 2s...")
+            if not state.streaming or not state.rtsp_mode:
+                logger.info("RTSP Loop: Shutdown detected during error recovery.")
+                break
+                
+            logger.error(f"RTSP Loop Critical Error: {e}. Retry in 2s...")
             if container: 
                 try: container.close()
                 except: pass
-            time.sleep(2.0)
+            
+            # Responsive Sleep (Check every 0.1s)
+            for _ in range(20):
+                if not state.streaming or not state.rtsp_mode: break
+                time.sleep(0.1)
             
     logger.info(f"RTSP Publisher Thread Exit (Streaming: {state.streaming})")

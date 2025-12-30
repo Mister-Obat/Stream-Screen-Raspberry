@@ -136,8 +136,8 @@ def receive_thread_func(sock):
         pass
         
     print("[NET] Receive Thread Ended.")
-    # Signal decoder to stop?
-    # We can push a sentinel or rely on 'running' flag
+    # Signal main loop to restart immediately
+    running = False
 
 
 def decode_thread_func():
@@ -219,7 +219,7 @@ def network_start(sock):
 
 
 def main():
-    global running, latest_frame
+    global running, latest_frame, last_packet_time
     
     print("="*40)
     print(" STREAM RECEIVER v2.4 (Ultra Low Latency + 5min Timeout)")

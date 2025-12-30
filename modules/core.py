@@ -301,62 +301,73 @@ def stream_thread_func():
                 t3 = time.time()
 
                 # --- [OPTIM] PRE-ENCODING DROP (Congestion Control) ---
-                # Calculate buffer depth in frames based on FPS (Time-based logic)
-                # state.latency_value (0-100) maps roughly to 0s - 2.0s buffer range
-                # Example: Val=10 => 0.2s, Val=100 => 2.0s
-                # We normalize so behavior is consistent across 15 FPS and 60 FPS
-                
-                target_buffer_sec = max(0.2, state.latency_value / 50.0) 
-                user_threshold = max(5, int(target_buffer_sec * state.fps))
-                
-                # Check congestion
-                full_tcp = conn is not None and buffer_tcp.q.qsize() > user_threshold
-                full_rtsp = state.rtsp_mode and buffer_rtsp.q.qsize() > user_threshold
-                
-                # STRATEGY 1: "Snap-to-Live" (Low Latency Mode < 20%)
-                # If we are lagging, we BURN the buffer.
-                # [FIX] "Direct à tout prix" Logic: If latency slider is very low (< 5%), 
-                # we tolerate ZERO buffer. Any queue > 0 is treated as lag.
-                
-                real_buffer_limit = user_threshold
-                if state.latency_value < 5: 
-                    real_buffer_limit = 0 # STRICT Mode
-                
-                full_tcp = conn is not None and buffer_tcp.q.qsize() > real_buffer_limit
-                full_rtsp = state.rtsp_mode and buffer_rtsp.q.qsize() > real_buffer_limit
-                
-                if (full_tcp or full_rtsp) and state.latency_value < 20:
-                     if full_tcp: 
-                         with buffer_tcp.q.mutex: 
-                             q_len = len(buffer_tcp.q.queue)
-                             buffer_tcp.q.queue.clear()
-                             dropped_tcp_total += q_len
-                         logger.debug(f"Snap-to-Live TCP: Flushed {q_len} frames!")
-                         
-                     # [FIX] Do NOT clear RTSP buffer blindly.
-                     # Reverted strict mode as it causes jitter for local MediaMTX connection.
-                     # We only drop if it's EXTREMELY full (emergency only).
-                     if full_rtsp and buffer_rtsp.q.qsize() > state.fps * 2: # Only if > 2 seconds lag
-                         with buffer_rtsp.q.mutex: 
-                             q_len = len(buffer_rtsp.q.queue)
-                             buffer_rtsp.q.queue.clear()
-                             dropped_rtsp_total += q_len
-                         logger.warning(f"Snap-to-Live RTSP: Flushed EMERGENCY {q_len} frames (>2s lag)")
-                         if encoder: encoder.force_next_keyframe()
-                     elif full_tcp:
-                        if encoder: encoder.force_next_keyframe()
-                     
-                     # We do NOT drop this current frame, we want to encode it as the new IDR!
-                     
-                # STRATEGY 2: "Smooth Drop" (Quality Mode >= 20%)
-                # Just skip this frame to allow buffer to drain naturally.
-                elif (full_tcp or full_rtsp):
-                    if full_tcp: dropped_tcp_total += 1
-                    if full_rtsp: dropped_rtsp_total += 1
-                    frames_total_sec += 1 
+                # "LATENCY IS THE BOSS" Logic
+                # 0-10%: REAL-TIME PRIORITY (Aggressive Drop / Snap-to-Live)
+                # 11-90%: BALANCED (Smooth Drop)
+                # 91-100%: QUALITY PRIORITY (Never Drop)
+
+                # 1. QUALITY MODE (> 90%)
+                if state.latency_value > 90:
+                    # We REFUSE to drop frames proactively. We trust the network or allow buffer to grow.
+                    # Only check for extreme OOM protection (e.g. > 5 seconds buffer)
+                    oom_threshold = state.fps * 5 
                     
-                    # We throttle at start of loop, so just continue
-                    continue # Skip Encoding
+                    full_tcp = conn is not None and buffer_tcp.q.qsize() > oom_threshold
+                    full_rtsp = state.rtsp_mode and buffer_rtsp.q.qsize() > oom_threshold
+                    
+                    if full_tcp or full_rtsp:
+                        # EMERGENCY ONLY
+                         if full_tcp: dropped_tcp_total += 1
+                         if full_rtsp: dropped_rtsp_total += 1
+                         frames_total_sec += 1
+                         continue
+                
+                # 2. REAL-TIME MODE (< 10%)
+                elif state.latency_value < 10:
+                    # STRICT ZERO BUFFER POLICY
+                    # If there is ANY packet in the queue, we are lagging.
+                    # We FLUSH everything to snap back to live.
+                    
+                    # Threshold: 1 frame (basically 0 but allow 1 to be in transit)
+                    strict_limit = 0 if state.latency_value < 5 else 1
+                    
+                    full_tcp = conn is not None and buffer_tcp.q.qsize() > strict_limit
+                    full_rtsp = state.rtsp_mode and buffer_rtsp.q.qsize() > max(strict_limit, state.fps * 0.5) # RTSP needs ~0.5s grace
+                    
+                    if full_tcp:
+                        with buffer_tcp.q.mutex:
+                            q_len = len(buffer_tcp.q.queue)
+                            buffer_tcp.q.queue.clear()
+                            dropped_tcp_total += q_len
+                        # Force Keyframe after flush
+                        if encoder: encoder.force_next_keyframe()
+                        # Do NOT continue (drop current), we want to encode THIS fresh frame as keyframe!
+                    
+                    if full_rtsp:
+                         # RTSP flush is risky for players, only do it if really bad (> 1s)
+                         if buffer_rtsp.q.qsize() > state.fps:
+                             with buffer_rtsp.q.mutex:
+                                 buffer_rtsp.q.queue.clear()
+                                 if encoder: encoder.force_next_keyframe()
+                
+                # 3. BALANCED MODE (10-90%)
+                else:
+                    # Calculated acceptable buffer based on slider
+                    # 10% -> 0.2s
+                    # 90% -> 2.0s
+                    # Linear mapping
+                    target_sec = 0.2 + ((state.latency_value - 10) / 80.0) * 1.8 
+                    allowed_frames = int(target_sec * state.fps)
+                    
+                    full_tcp = conn is not None and buffer_tcp.q.qsize() > allowed_frames
+                    full_rtsp = state.rtsp_mode and buffer_rtsp.q.qsize() > allowed_frames
+                    
+                    if full_tcp or full_rtsp:
+                        # SMOOTH DROP: Skip this frame to let buffer drain
+                        if full_tcp: dropped_tcp_total += 1
+                        if full_rtsp: dropped_rtsp_total += 1
+                        frames_total_sec += 1
+                        continue
 
                 # ENCODE (H.264)
                 packets = encoder.encode(frame_bgr)
@@ -388,9 +399,10 @@ def stream_thread_func():
                 
                 # Update Stats
                 t_now = time.time()
-                if t_now - last_stat_time >= 1.0:
-                    state.current_fps = frame_count
-                    state.current_mbps = (byte_count * 8) / (1000 * 1000)
+                if t_now - last_stat_time >= 0.5:
+                    elapsed = t_now - last_stat_time
+                    state.current_fps = int(frame_count / elapsed)
+                    state.current_mbps = ((byte_count * 8) / (1000 * 1000)) / elapsed
                     
                     # Calc Loss % (Independent)
                     loss_tcp_pct = 0.0
