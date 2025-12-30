@@ -12,9 +12,11 @@
 
 ## Vue d'ensemble
 
-**Stream Screen** n'est pas un simple partage d'écran. C'est un moteur de streaming optimisé, conçu pour transformer n'importe quel moniteur (physique ou virtuel) en flux vidéo **H.264** fluide et réactif via votre réseau local.
+**Stream Screen** est une solution de streaming hybride haute performance. Elle transforme votre bureau en flux vidéo **H.264** fluide et réactif, accessible de deux manières simultanées :
+1.  **Vers Raspberry Pi** (via application native TCP optimisée).
+2.  **Vers Navigateur Web** (via WebRTC ultra-rapide) pour mobiles, tablettes et autres PC sans installation.
 
-Contrairement aux solutions classiques (VNC, MJPEG), Stream Screen exploite l'accélération matérielle **NVENC/AMF** de votre carte graphique et le protocole **UDP** pour garantir une expérience sans-fil proche du câble HDMI.
+Elle utilise l'accélération matérielle **NVENC/AMF** et le moteur **MediaMTX** embarqué pour garantir une expérience proche du zéro latence.
 
 ### Écran Virtuel (Optionnel)
 
@@ -24,32 +26,33 @@ Il permet d'ajouter un écran virtuel à votre PC, idéal pour étendre votre bu
 ## Fonctionnalités Clés
 
 *   **Architecture "Zero-Copy"** : Capture DXCam directe vers Encodeur GPU.
-*   **Auto-Recovery (Watchdog)** : Détection intelligente de perte de signal et redémarrage automatique synchronisé (PC + Pi).
-*   **Console de Supervision** : Visualisez les logs du PC et du Raspberry Pi (via SSH) en temps réel directement dans l'app.
-*   **Contrôle Total SSH** : Lancez, arrêtez ou mettez à jour le script sur le Pi d'un simple clic.
+*   **WebRTC Natif** : Partagez votre écran sur n'importe quel navigateur (Chrome, Safari, Edge) via un simple lien.
+*   **Auto-Kill (Pi)** : Le récepteur Raspberry Pi se coupe automatiquement après 20s d'inactivité (plus d'écran figé).
+*   **Console de Supervision** : Visualisez les logs du PC, du Raspberry Pi (SSH) et du Serveur de Diffusion en un seul endroit.
+*   **Contrôle Total SSH** : Lancez, arrêtez ou mettez à jour le script sur le Pi d'un simple clic depuis Windows.
 *   **Encodage H.264 Hardware** : Compatible NVIDIA (NVENC) et AMD (AMF).
-*   **Smart Refresh (Nouveau)** : Déduplication d'images (0% bande passante sur écrans statiques).
-*   **Contrôle CPU Nul** : L'ordinateur reste 100% disponible (Priorité Haute).
-*   **Déploiement SSH** : Pilotez le Raspberry Pi à distance directement depuis l'interface Windows.
-*   **Intelligent** : Adaptation dynamique du bitrate et curseur selon la résolution.
-*   **Monitoring** : Compteur de pertes en temps réel (%) et graphiques de latence.
+*   **Smart Refresh** : Déduplication d'images (0% bande passante sur écrans statiques).
+
 ## Options & Réglages
 
 L'application offre un contrôle total sur le flux :
 
-*   **Résolution** : De 360p à 4K. L'image est redimensionnée ("downscale") avant l'envoi pour économiser la bande passante, puis remise à l'échelle ("upscale") sur le Pi.
+*   **Résolution** : De 360p à 4K.
 *   **Architecture** :
     *   **GPU (NVIDIA)** : Utilise NVENC. Ultra-rapide. Zéro charge CPU.
     *   **CPU (Compatibility)** : Utilise x264. Compatible tout PC.
 *   **FPS (5 - 120)** : Ajustez la fluidité selon votre réseau.
-*   **Bitrate (0.1 - 25 Mbps)** : Contrôlez la qualité d'image. Pour le Wifi, 5-8 Mbps est recommandé.
-*   **Latence (Slider)** : Compromis entre réactivité et fluidité.
-    *   **10-20%** : Mode "Haoe Fréquence" (Gaming/Bureau).
-    *   **50%+** : Mode "Tampon" (Films/Vidéos) pour absorber les saccades réseau.
-*   **Smart Refresh** : Si l'image est statique, le débit tombe à 0. Un "heartbeat" est envoyé toutes les 0.5s pour maintenir la connexion.
+*   **Bitrate (0.1 - 25 Mbps)** : Contrôle de qualité.
+*   **Latence (Slider)** : Compromis réactivité vs fluidité.
+*   **Modes de Diffusion** :
+    *   **LIVE** : Dashboard principal.
+    *   **RASPBERRY** : Client lourd optimisé (TCP).
+    *   **WEBRTC** : Client léger universel (Navigateur).
+*   **Smart Refresh** : Si l'image est statique, le débit tombe à 0 (Heartbeat actif).
 *   **Mode Console** :
-    *   **Local** : Affiche les logs de l'application PC (FPS, Bitrate, Erreurs).
-    *   **Remote (SSH)** : Affiche en direct les logs du Raspberry Pi pour un diagnostic instantané.
+    *   **Local** : Logs PC.
+    *   **Pi (SSH)** : Logs Raspberry Pi.
+    *   **Serveur** : Logs MediaMTX (WebRTC).
 
 ## Mise en Route
 

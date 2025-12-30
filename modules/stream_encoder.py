@@ -1,6 +1,7 @@
 import av
 import numpy as np
 import logging
+import time
 from fractions import Fraction
 
 logger = logging.getLogger("VideoEncoder")
@@ -20,11 +21,16 @@ class VideoEncoder:
         self.width = width
         self.height = height
         self.fps = fps
+        self.frame_count = 0
+        self.start_time = None # [NEW] For Wall-Clock PTS
         self.bitrate = bitrate
         self.preset_choice = preset_choice or "fast"
         
         self.ctx = None
         self.codec_name = "libx264" # Default fallback
+        self._force_keyframe = True # [FIX] ALWAYS start with a Keyframe (IDR)
+        self.frame_count = 0 
+        self.start_time = None # [NEW] For Wall-Clock PTS
         
         # 1. Select Codec
         if codec_choice == "auto" or codec_choice == "nvenc":
@@ -60,7 +66,7 @@ class VideoEncoder:
             self.ctx.thread_count = 1 
             self.ctx.thread_type = "SLICE"
             
-            self.ctx.gop_size = self.fps * 2 # Keyframe every 2 seconds
+            self.ctx.gop_size = self.fps # Keyframe every 1 second (Better for Low Latency)
             
             # 3. Apply Low Latency Optimizations
             self.ctx.max_b_frames = 0 # STRICTLY 0 B-frames for low latency
@@ -89,10 +95,16 @@ class VideoEncoder:
                 self.ctx.options = {
                     "preset": p_val,
                     "tune": "zerolatency",
-                    "nal-hrd": "cbr",
+                    "profile": "baseline", # [FIX] Baseline is required for broad player stability (WebRTC/RTSP)
+                    "bframes": "0", # Force 0 B-frames
+                    # "nal-hrd": "cbr", # DISABLED: Causes buffering pauses if bitrate dips
                     "maxrate": str(self.bitrate),
-                    "bufsize": str(self.bitrate),
+                    "bufsize": str(self.bitrate * 2), # Allow 2s burst buffer (prevents underrun)
                 }
+            
+            # [FIX] Critical for RTSP/MP4 containers: Global Header (SPS/PPS in extradata)
+            # REVERTED: This caused Mbps:0.0 (no packets) on Windows/x264.
+            # self.ctx.flags |= av.codec.CodecContext.FLAG_GLOBAL_HEADER
             
             self.ctx.open()
             logger.info(f"VideoEncoder initialized with {self.codec_name} @ {width}x{height}")
@@ -121,11 +133,36 @@ class VideoEncoder:
             # It runs on CPU.
             frame = av.VideoFrame.from_ndarray(frame_bgr, format='bgr24')
             
+            # [NEW] Force Keyframe if requested
+            if self._force_keyframe:
+                frame.pict_type = av.video.frame.PictureType.I
+                self._force_keyframe = False # Reset flag
+                # logger.info("Forcing Keyframe (IDR)")
+            
+            # [FIX] Strict Monotonic PTS (Counter-based) for RTSP Stability
+            # Wall-Clock skipping can cause gaps that confuse players/muxers.
+            # We rely on the core loop's timing to keep real-time.
+            
+            self.frame_count += 1
+            
+            frame.pts = self.frame_count
+            frame.time_base = self.ctx.time_base # 1/fps
+            
+            # Force Keyframe (IDR) strictly every GOP (e.g. 60 frames)
+            # This ensures HLS always has a cut point every second.
+            if self.frame_count % self.fps == 0:
+                frame.pict_type = av.video.frame.PictureType.I
+                self._force_keyframe = False # Clear manual flag if any
+            
+            # Manual Keyframe Request
+            if self._force_keyframe:
+                frame.pict_type = av.video.frame.PictureType.I
+                self._force_keyframe = False
+            
             packets = self.ctx.encode(frame)
             
-            # Return raw bytes of packets
-            # PyAV Packet to bytes: simply use bytes(packet)
-            return [bytes(p) for p in packets]
+            # Return raw PACKETS (needed for Muxing/RTSP)
+            return packets
             
         except Exception as e:
             logger.error(f"Encode Error: {e}")
@@ -136,6 +173,11 @@ class VideoEncoder:
             try:
                 # Flush
                 packets = self.ctx.encode(None)
-                return [bytes(p) for p in packets]
+                packets = self.ctx.encode(None)
+                return packets
             except: pass
         return []
+
+    def force_next_keyframe(self):
+        """Request the next frame to be an IDR Keyframe"""
+        self._force_keyframe = True
