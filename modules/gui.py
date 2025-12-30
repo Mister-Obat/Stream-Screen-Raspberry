@@ -317,7 +317,7 @@ class StreamApp(ctk.CTk):
 
         
         # Checkbox for Pi Auto-Restart (Renamed)
-        self.chk_auto_pi = ctk.CTkCheckBox(self.tab_pi, text="Tentative de reconnexion automatique (Max 2h)", font=("Segoe UI", 12))
+        self.chk_auto_pi = ctk.CTkCheckBox(self.tab_pi, text="Reconnexion automatique (Stop après 2h d'essai)", font=("Segoe UI", 12))
         self.chk_auto_pi.pack(anchor="w", padx=15, pady=10)
         
         # === TAB: DIFFUSION (BROADCAST) ===
@@ -709,7 +709,8 @@ class StreamApp(ctk.CTk):
     def _rtsp_startup_success(self):
         if hasattr(self, 'loading_win'): self.loading_win.destroy()
         self.lbl_rtsp_status.configure(text="Statut: Actif (Serveur en cours)", text_color="green")
-        messagebox.showinfo("Succès", "Le serveur de diffusion est en ligne !")
+        # messagebox.showinfo("Succès", "Le serveur de diffusion est en ligne !")
+        self.show_custom_popup("Diffusion Web", "Le serveur de diffusion est en ligne !", type="success")
 
     def _rtsp_startup_fail(self, error_msg):
         if hasattr(self, 'loading_win'): self.loading_win.destroy()
@@ -1075,7 +1076,8 @@ class StreamApp(ctk.CTk):
                 sftp.close()
                 
                 self.lbl_status.configure(text="SFTP: Succès!", text_color="green")
-                self.after(0, lambda: messagebox.showinfo("Mise à jour", "Le fichier a été mis à jour avec succès sur le Raspberry Pi."))
+                # self.after(0, lambda: messagebox.showinfo("Mise à jour", "Le fichier a été mis à jour avec succès sur le Raspberry Pi."))
+                self.after(0, lambda: self.show_custom_popup("Mise à jour SSH", "Le fichier a été mis à jour avec succès !", type="success"))
                 
             except Exception as e:
                 logger.error(f"SFTP Error: {e}")
@@ -1258,3 +1260,62 @@ class StreamApp(ctk.CTk):
         self.destroy()
         logger.info("Shutdown: Complete.")
         os._exit(0) # Force Kill to prevent hanging threads
+        
+    def show_custom_popup(self, title, message, type="success"):
+        """
+        Affiche un overlay centré joli style 'Midnight Indigo'
+        """
+        # Create Toplevel
+        pop = ctk.CTkToplevel(self)
+        pop.title("")
+        pop.geometry("350x200")
+        pop.transient(self) # Lock to main
+        pop.grab_set()      # Modal
+        pop.resizable(False, False)
+        
+        # Remove standard title bar for full custom look on Windows
+        try: pop.overrideredirect(True) 
+        except: pass
+        
+        # Colors based on type
+        border_col = self.C_SUCCESS if type=="success" else self.C_ACCENT
+        if type == "error": border_col = self.C_DANGER
+        
+        # Main Frame with Border
+        frm = ctk.CTkFrame(pop, fg_color=self.C_CARD, border_width=2, border_color=border_col, corner_radius=16)
+        frm.pack(fill="both", expand=True)
+        
+        # Center in App
+        # Need to force update logic to get window coords?
+        # A simple calc usually works if main window is visible
+        try:
+            x = self.winfo_x() + (self.winfo_width() // 2) - 175
+            y = self.winfo_y() + (self.winfo_height() // 2) - 100
+            pop.geometry(f"+{x}+{y}")
+        except: 
+            pop.geometry("+200+200") # Fallback
+            
+        # Icon/color strip top? 
+        # Just simple clean text
+        
+        # Title
+        ctk.CTkLabel(frm, text=title, font=("Segoe UI", 18, "bold"), text_color="white").pack(pady=(25, 10))
+        
+        # Message
+        ctk.CTkLabel(frm, text=message, font=("Segoe UI", 13), text_color="#BDC3C7", wraplength=300).pack(pady=10)
+        
+        # Button
+        def close():
+            pop.grab_release()
+            pop.destroy()
+            
+        btn = ctk.CTkButton(frm, text="OK", font=("Segoe UI", 12, "bold"), 
+                            fg_color=self.C_BG, border_color=border_col, border_width=1,
+                            hover_color=self.C_CARD_HOVER, text_color="white",
+                            width=100, height=35, command=close)
+        btn.pack(side="bottom", pady=20)
+        
+        # Small animation (fade in) could be nice but complexity risk. 
+        # Just ensure it pops on top.
+        pop.lift()
+        pop.focus_force()

@@ -7,29 +7,29 @@ from fractions import Fraction
 logger = logging.getLogger("VideoEncoder")
 
 class VideoEncoder:
-    def __init__(self, width=1280, height=720, fps=60, bitrate=4000000, codec_choice="auto", preset_choice="fast"):
+
+    
+    def __init__(self, width=1280, height=720, fps=60, bitrate=4000000, codec_choice="auto", preset_choice="fast", initial_pts=0):
         """
         Initialize the Video Encoder.
         :param width: Video width
         :param height: Video height
         :param fps: Target FPS
-        :param fps: Target FPS
         :param bitrate: Target bitrate in bits/s (e.g. 4000000 for 4Mbps)
         :param codec_choice: 'auto', 'nvenc', 'x264'
         :param preset_choice: 'fast', 'balanced', 'quality'
+        :param initial_pts: Starting value for monotonic PTS (prevents timeline reset on restart)
         """
         self.width = width
         self.height = height
         self.fps = fps
-        self.frame_count = 0
-        self.start_time = None # [NEW] For Wall-Clock PTS
         self.bitrate = bitrate
         self.preset_choice = preset_choice or "fast"
         
         self.ctx = None
         self.codec_name = "libx264" # Default fallback
         self._force_keyframe = True # [FIX] ALWAYS start with a Keyframe (IDR)
-        self.frame_count = 0 
+        self.frame_count = initial_pts 
         self.start_time = None # [NEW] For Wall-Clock PTS
         
         # 1. Select Codec

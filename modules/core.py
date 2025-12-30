@@ -193,7 +193,13 @@ def stream_thread_func():
             else:
                  logger.info("[AUDIO] Disabled (Muted by Config)")
 
-            encoder = VideoEncoder(enc_w, enc_h, state.fps, bitrate_bps, codec_choice=state.codec_choice, preset_choice=state.encoder_preset)
+            # [OPTIM] Monotonic PTS: Repair Timeline
+            # Resume frame count from previous encoder to prevent "time reset" errors in MediaMTX/WebRTC
+            initial_pts = 0
+            if encoder:
+                 initial_pts = encoder.frame_count
+            
+            encoder = VideoEncoder(enc_w, enc_h, state.fps, bitrate_bps, codec_choice=state.codec_choice, preset_choice=state.encoder_preset, initial_pts=initial_pts)
             state.encoder = encoder # Expose for RTSP (extradata)
             
             # Init Capture
@@ -344,11 +350,10 @@ def stream_thread_func():
                         # Do NOT continue (drop current), we want to encode THIS fresh frame as keyframe!
                     
                     if full_rtsp:
-                         # RTSP flush is risky for players, only do it if really bad (> 1s)
-                         if buffer_rtsp.q.qsize() > state.fps:
-                             with buffer_rtsp.q.mutex:
-                                 buffer_rtsp.q.queue.clear()
-                                 if encoder: encoder.force_next_keyframe()
+                         # [OPTIM] NO FLUSH for WebRTC (Localhost)
+                         # As requested: "Je ne supprime plus les images pour le serveur local... le navigateur gère."
+                         # We skip the flush logic for RTSP to prevent visual stutter ("trous").
+                         pass
                 
                 # 3. BALANCED MODE (10-90%)
                 else:
@@ -360,7 +365,9 @@ def stream_thread_func():
                     allowed_frames = int(target_sec * state.fps)
                     
                     full_tcp = conn is not None and buffer_tcp.q.qsize() > allowed_frames
-                    full_rtsp = state.rtsp_mode and buffer_rtsp.q.qsize() > allowed_frames
+                    # [OPTIM] For WebRTC, we validly decided to NEVER drop frames proactively (except OOM)
+                    # full_rtsp = state.rtsp_mode and buffer_rtsp.q.qsize() > allowed_frames 
+                    full_rtsp = False 
                     
                     if full_tcp or full_rtsp:
                         # SMOOTH DROP: Skip this frame to let buffer drain
@@ -452,10 +459,10 @@ def stream_thread_func():
         
         loop_start_time = time.perf_counter()
         
-        # FPS Cap
-        dt = time.time() - t_start
-        target_dt = 1.0 / state.fps
-        if dt < target_dt: time.sleep(target_dt - dt)
+        # [OPTIM] Sleep optimization (Input Lag)
+        # Capture -> Send -> Sleep -> Capture
+        # This was already handled by the logic above (lines 447-451).
+        # We remove the redundant sleep block here to avoid double-waiting.
 
     # Cleanup when loop ends
     buffer_tcp.running = False
