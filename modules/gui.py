@@ -11,7 +11,7 @@ import paramiko
 import webbrowser
 from modules.config import state
 from modules.core import stream_thread_func
-from modules.custom_utils import TextHandler, get_monitors
+from modules.custom_utils import TextHandler, get_monitors, get_cpu_usage, get_gpu_usage
 
 logger = logging.getLogger("SenderGUI")
 
@@ -122,7 +122,17 @@ class StreamApp(ctk.CTk):
         self.card_video = ctk.CTkFrame(self.tab_stream, fg_color=self.C_CARD, corner_radius=16, border_width=1, border_color=self.C_BORDER)
         self.card_video.pack(fill="x", pady=10)
         
-        ctk.CTkLabel(self.card_video, text="SIGNAL VIDÉO", font=self.F_SMALL, text_color=self.C_TEXT_DIM).pack(anchor="w", padx=20, pady=(15, 10))
+        # Header with Metrics
+        frm_vid_header = ctk.CTkFrame(self.card_video, fg_color="transparent")
+        frm_vid_header.pack(fill="x", padx=20, pady=(15, 10))
+        
+        ctk.CTkLabel(frm_vid_header, text="SIGNAL VIDÉO", font=self.F_SMALL, text_color=self.C_TEXT_DIM).pack(side="left")
+        
+        self.lbl_gpu = ctk.CTkLabel(frm_vid_header, text="GPU: 0%", font=("Segoe UI", 10, "bold"), text_color=self.C_ACCENT)
+        self.lbl_gpu.pack(side="right", padx=(10, 0))
+        
+        self.lbl_cpu = ctk.CTkLabel(frm_vid_header, text="CPU: 0%", font=("Segoe UI", 10, "bold"), text_color=self.C_TEXT)
+        self.lbl_cpu.pack(side="right")
         
         # Unified Grid for Video Settings (2x2)
         frm_grid = ctk.CTkFrame(self.card_video, fg_color="transparent")
@@ -298,21 +308,24 @@ class StreamApp(ctk.CTk):
         self.frm_pi_btns = ctk.CTkFrame(self.tab_pi, fg_color="transparent")
         self.frm_pi_btns.pack(fill="x", padx=5, pady=20)
         
-        # Grid Layout for cleaner alignment
+        # Grid Layout
         self.frm_pi_btns.columnconfigure(0, weight=1)
         self.frm_pi_btns.columnconfigure(1, weight=1)
         
-        # Row 0: Launch and Stop (Side by Side)
-        self.btn_launch_pi = ctk.CTkButton(self.frm_pi_btns, text="LANCER", font=("Segoe UI", 14, "bold"), height=45, fg_color="#0D2616", border_width=1, border_color=self.C_SUCCESS, text_color=self.C_SUCCESS, hover_color="#183622", command=self.launch_pi)
-        self.btn_launch_pi.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
-
+        # Row 0: Launch Buttons (Fullscreen | Windowed)
+        self.btn_launch_full = ctk.CTkButton(self.frm_pi_btns, text="STREAM FULLSCREEN", font=("Segoe UI", 12, "bold"), height=45, fg_color="#0D2616", border_width=1, border_color=self.C_SUCCESS, text_color=self.C_SUCCESS, hover_color="#183622", command=lambda: self.launch_pi("fullscreen"))
+        self.btn_launch_full.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
         
-        self.btn_stop_pi = ctk.CTkButton(self.frm_pi_btns, text="ARRÊTER", font=("Segoe UI", 14, "bold"), height=45, fg_color="#271818", border_width=1, border_color=self.C_DANGER, text_color=self.C_DANGER, hover_color="#421C1C", command=self.stop_pi_manual)
-        self.btn_stop_pi.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
+        self.btn_launch_win = ctk.CTkButton(self.frm_pi_btns, text="STREAM FENÊTRÉ", font=("Segoe UI", 12, "bold"), height=45, fg_color="#0D2616", border_width=1, border_color=self.C_SUCCESS, text_color=self.C_SUCCESS, hover_color="#183622", command=lambda: self.launch_pi("windowed"))
+        self.btn_launch_win.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
         
-        # Row 1: Update (Full Width)
+        # Row 1: Stop (Full Width)
+        self.btn_stop_pi = ctk.CTkButton(self.frm_pi_btns, text="ARRÊTER", font=("Segoe UI", 14, "bold"), height=40, fg_color="#271818", border_width=1, border_color=self.C_DANGER, text_color=self.C_DANGER, hover_color="#421C1C", command=self.stop_pi_manual)
+        self.btn_stop_pi.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=(10, 5))
+        
+        # Row 2: Update (Full Width)
         self.btn_update_pi = ctk.CTkButton(self.frm_pi_btns, text="METTRE À JOUR (SSH)", font=("Segoe UI", 12, "bold"), height=35, fg_color="transparent", border_width=1, border_color=self.C_ACCENT, text_color=self.C_ACCENT, hover_color="#18202A", command=self.update_pi)
-        self.btn_update_pi.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=(10, 0))
+        self.btn_update_pi.grid(row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=(5, 0))
 
 
         
@@ -477,13 +490,15 @@ class StreamApp(ctk.CTk):
             # --- BUTTON STATE MANAGEMENT (STICKY) ---
             if state.client_connected:
                  # Priority 1: CONNECTED
-                 self.btn_launch_pi.configure(text="CONNECTÉ", state="disabled", fg_color="#1F2937") # Grey
+                 self.btn_launch_full.configure(text="CONNECTÉ", state="disabled", fg_color="#1F2937") 
+                 self.btn_launch_win.configure(state="disabled", fg_color="#1F2937")
             elif hasattr(self, "failure_start_time") and self.failure_start_time is not None and self.chk_auto_pi.get():
                  # Priority 2: AUTO-RECONNECTING
-                 self.btn_launch_pi.configure(text="RECONNEXION...", state="disabled", fg_color="#7c4d08") # Dark Orange
-            elif self.btn_launch_pi.cget("text") in ["CONNECTÉ", "RECONNEXION..."]:
+                 self.btn_launch_full.configure(text="RECONNEXION...", state="disabled", fg_color="#7c4d08")
+                 self.btn_launch_win.configure(state="disabled")
+            elif self.btn_launch_full.cget("text") in ["CONNECTÉ", "RECONNEXION..."]:
                  # Priority 3: Reset to Default if we fell out of other states
-                 self.btn_launch_pi.configure(text="LANCER", state="normal", fg_color="#0D2616")
+                 self.reset_launch_buttons()
         else:
             msg = "Status: Arrêté"
             color = "gray"
@@ -491,6 +506,47 @@ class StreamApp(ctk.CTk):
         if self.btn_start.cget("text") == "STOPPER LE FLUX": # Only update if running to avoid overriding connection messages
              self.lbl_status.configure(text=msg, text_color=color)
         
+        # --- Metrics Update ---
+        # Frequency: Every ~2s.
+        # get_cpu_usage() now blocks for 0.5s.
+        # So we don't need to wait 4 ticks (2s) explicitly if the thread itself takes 0.5s.
+        # But we still want to avoid hammering psutil. Let's keep a small delay.
+        
+        if not hasattr(self, "metrics_thread_active"): self.metrics_thread_active = False
+        
+        # Only start if previous thread finished (avoid stacking)
+        if not self.metrics_thread_active:
+             self.metrics_thread_active = True
+             def _fetch_and_update():
+                 try:
+                     # This blocks for 0.5s
+                     c = get_cpu_usage() 
+                     g = get_gpu_usage()
+                     
+                     # Update UI safely
+                     def _update_ui():
+                         if hasattr(self, 'lbl_cpu'): 
+                             # Color coding
+                             col_c = self.C_TEXT
+                             if c > 80: col_c = self.C_DANGER
+                             elif c > 50: col_c = self.C_WARN
+                             self.lbl_cpu.configure(text=f"CPU: {c:.0f}%", text_color=col_c)
+                             
+                         if hasattr(self, 'lbl_gpu'): 
+                             col_g = self.C_ACCENT if g < 80 else self.C_DANGER
+                             self.lbl_gpu.configure(text=f"GPU: {g}%", text_color=col_g)
+                             
+                         self.metrics_thread_active = False # Release lock
+                         
+                     self.after(0, _update_ui)
+                 except:
+                     self.metrics_thread_active = False
+            
+             # Start thread with a slight delay if we want 2s interval
+             # But simply starting it here every monitor_stats call (500ms) with a lock check is fine.
+             # If thread takes 0.5s, it will run every ~0.5-1.0s.
+             threading.Thread(target=_fetch_and_update, daemon=True).start()
+
         self.after(500, self.monitor_stats)
     
     def on_mon_change(self, choice):
@@ -846,7 +902,11 @@ class StreamApp(ctk.CTk):
                        look_for_keys=False, allow_agent=False)
         return client
 
-    def launch_pi(self):
+    def reset_launch_buttons(self):
+        self.btn_launch_full.configure(state="normal", text="STREAM FULLSCREEN", fg_color="#0D2616")
+        self.btn_launch_win.configure(state="normal", text="STREAM FENÊTRÉ", fg_color="#0D2616")
+
+    def launch_pi(self, mode="fullscreen"):
         ip = self.ent_ip.get()
         user = self.ent_user.get()
         pwd = self.ent_pass.get()
@@ -857,13 +917,21 @@ class StreamApp(ctk.CTk):
             print("ERROR: Missing IP or User")
             return
             
-        self.btn_launch_pi.configure(state="disabled", text="CONNEXION...")
+        # Disable buttons
+        self.btn_launch_full.configure(state="disabled")
+        self.btn_launch_win.configure(state="disabled")
+        
+        if mode == "fullscreen":
+            self.btn_launch_full.configure(text="CONNEXION...")
+        else:
+            self.btn_launch_win.configure(text="CONNEXION...")
         
         self.save_config()
         
         # Mark as Pi Streaming for Watchdog
         state.pi_streaming = True
-        logger.info("GUI: Pi Streaming Mode ACTIVE")
+        state.pi_windowed_mode = (mode == "windowed") # Track for restart
+        logger.info(f"GUI: Pi Streaming Mode ACTIVE (Mode: {mode})")
 
         # AUTO-START STREAM IF NEEDED
         async_start = False
@@ -946,9 +1014,13 @@ class StreamApp(ctk.CTk):
                 retry_flag = ""
                 if self.chk_auto_pi.get():
                      retry_flag = " --retry"
+                     
+                windowed_flag = ""
+                if mode == "windowed":
+                     windowed_flag = " --windowed"
                 
                 if pass_arg:
-                     final_cmd = f"echo '--- LAUNCHING PYTHON SCRIPT (ARG) ---' >> stream_receiver.log; export DISPLAY=:0 && export XAUTHORITY=~/.Xauthority && python3 -u {path} {local_ip}{retry_flag} >> stream_receiver.log 2>&1 &"
+                     final_cmd = f"echo '--- LAUNCHING PYTHON SCRIPT (ARG) ---' >> stream_receiver.log; export DISPLAY=:0 && export XAUTHORITY=~/.Xauthority && python3 -u {path} {local_ip}{retry_flag}{windowed_flag} >> stream_receiver.log 2>&1 &"
                 
                 logger.info(f"SSH Executing: {final_cmd}")
                 self.after(0, lambda: self.lbl_status.configure(text="SSH: Lancement...", text_color="blue"))
@@ -970,13 +1042,9 @@ class StreamApp(ctk.CTk):
 
                 self.after(0, lambda: messagebox.showerror("Erreur Connexion", str(e)))
                 # ON FAILURE: Reset Button
-                self.after(0, lambda: self.btn_launch_pi.configure(state="normal", text="LANCER"))
+                self.after(0, lambda: self.reset_launch_buttons())
             
             finally:
-                # SUCCESS: Leave button Disabled (User wants confirmation "Connected/Running")
-                # ERROR: Reset button to "LANCER"
-                # To differentiate, we check if we reached end of try block logic successfully?
-                # Actually, if we are in finally, exception might have happened.
                 pass
                 
         threading.Thread(target=ssh_task, daemon=True).start()
@@ -1021,7 +1089,7 @@ class StreamApp(ctk.CTk):
                 
                 self.lbl_status.configure(text="SSH: Processus stoppé.", text_color="green")
                 # Reset Launch Button
-                self.after(0, lambda: self.btn_launch_pi.configure(state="normal", text="LANCER", fg_color="#0D2616"))
+                self.after(0, lambda: self.reset_launch_buttons())
                 # if not silent: messagebox.showinfo("Succès", "Processus arrêté sur le Raspberry Pi.")
             except Exception as e:
                 logger.error(f"SSH Stop Error: {e}")
@@ -1115,7 +1183,8 @@ class StreamApp(ctk.CTk):
             time.sleep(1.0) # Short wait for socket cleanup
             
             # call launch_pi (on main thread to be safe with UI getters)
-            self.after(0, self.launch_pi)
+            mode = "windowed" if state.pi_windowed_mode else "fullscreen"
+            self.after(0, lambda: self.launch_pi(mode))
             
         threading.Thread(target=task, daemon=True).start()
 

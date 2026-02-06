@@ -226,13 +226,21 @@ def main():
     # 1. Discovery & Arg Parsing
     target_ip = None
     infinite_retry = False
+    opt_windowed = False
     
     # Parse args manually
     args = sys.argv[1:]
+    
+    # Filter flags
     if "--retry" in args:
         infinite_retry = True
         args.remove("--retry")
         print("[CONFIG] Mode Relance Automatique: ACTIVÉ (Infini)")
+
+    if "--windowed" in args:
+        opt_windowed = True
+        args.remove("--windowed")
+        print("[CONFIG] Mode Fenêtré: ACTIVÉ")
     
     if args:
         target_ip = args[0]
@@ -243,11 +251,33 @@ def main():
         print("Serveur non trouvé. Essayez de spécifier l'IP: python stream_receiver.py IP")
         return
 
-    # 2. Pygame Init (Moved outside loop to keep window open)
+
+    # State for toggle
+    is_fullscreen = True
+    last_click_time = 0.0
+
+    # 2. Pygame Init
     pygame.init()
-    # screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
-    screen = pygame.display.set_mode((1280, 720), pygame.FULLSCREEN | pygame.SCALED)
-    pygame.mouse.set_visible(False)
+    
+    # Get current resolution for explicit Fullscreen size (SCALED doesn't like 0,0)
+    info = pygame.display.Info()
+    monitor_w, monitor_h = info.current_w, info.current_h
+
+    # Display Setup
+    # Logic:
+    # If opt_windowed: Start Windowed (1280x720), Mouse Visible, Toggle Enabled
+    # Else: Start Fullscreen, Mouse Hidden, Toggle Disabled
+    
+    if opt_windowed:
+        is_fullscreen = False # Start Windowed
+        screen = pygame.display.set_mode((1280, 720), pygame.RESIZABLE)
+        pygame.mouse.set_visible(True)
+    else:
+        is_fullscreen = True # Forced Fullscreen
+        screen = pygame.display.set_mode((monitor_w, monitor_h), pygame.FULLSCREEN | pygame.SCALED)
+        pygame.mouse.set_visible(False)
+        
+    pygame.display.set_caption("Stream Receiver")
     clock = pygame.time.Clock()
     font = pygame.font.SysFont(None, 40)
 
@@ -326,11 +356,7 @@ def main():
         if not connected: return # Give up if not infinite or max retries reached
 
         # 4. Start Thread
-        # 4. Start Threads (Recv + Dec)
         network_start(sock)
-        # t = threading.Thread(target=network_thread_func, args=(sock,))
-        # t.daemon = True
-        # t.start()
         
         # 5. Main Loop (Serving)
         print("[MAIN] Entering Stream Loop...")
@@ -338,11 +364,9 @@ def main():
             dt = clock.tick(60)
             
             # CHECK TIMEOUT (Anti-Freeze)
-            # Increased to 300s (5 min) to be safe, relying on PING.
             if time.time() - last_packet_time > 300.0:
                  print("[TIMEOUT] Pas de données depuis 5 minutes. Fin du stream.")
                  running = False
-                 # This triggers loop exit -> main outer loop will decide to Exit or Reconnect
             
             for event in pygame.event.get():
                 if event.type == pygame.QUIT: 
@@ -352,6 +376,31 @@ def main():
                     if event.key == pygame.K_q or event.key == pygame.K_ESCAPE: 
                         running = False
                         user_quit = True
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    # Only allow toggle if windowed mode is enabled
+                    if opt_windowed and event.button == 1: # Left Click
+                        curr_time = time.time()
+                        if curr_time - last_click_time < 0.5:
+                            # Double Click Detected -> Toggle
+                            is_fullscreen = not is_fullscreen
+                            try:
+                                if is_fullscreen:
+                                    # Fetch explicit res again (in case it changed or to be safe)
+                                    info = pygame.display.Info()
+                                    screen = pygame.display.set_mode((info.current_w, info.current_h), pygame.FULLSCREEN | pygame.SCALED)
+                                    # User Request: If in windowed mode (which allows toggle), mouse must remain visible even in fullscreen
+                                    pygame.mouse.set_visible(True) 
+                                else:
+                                    screen = pygame.display.set_mode((1280, 720), pygame.RESIZABLE)
+                                    pygame.mouse.set_visible(True)
+                            except Exception as e:
+                                print(f"[DISPLAY] Toggle Error: {e}")
+                                # Revert state if failed
+                                is_fullscreen = not is_fullscreen
+                                
+                            last_click_time = 0.0 
+                        else:
+                            last_click_time = curr_time
 
             # Render
             frame_info = None
@@ -360,22 +409,34 @@ def main():
             
             if frame_info:
                 data, w, h = frame_info
-                # Resize if needed
-                if screen.get_width() != w or screen.get_height() != h:
-                     # Only resize if not fullscreen or if we want to adapt?
-                     # For now, let's just scale the surface to screen
-                     pass
-
+                
+                # --- Aspect Ratio Handling ---
+                target_rect = screen.get_rect()
+                screen_w, screen_h = target_rect.width, target_rect.height
+                
+                # Calculate scale to fit
+                scale_w = screen_w / w
+                scale_h = screen_h / h
+                scale = min(scale_w, scale_h)
+                
+                new_w = int(w * scale)
+                new_h = int(h * scale)
+                
+                # Center coords
+                x_offset = (screen_w - new_w) // 2
+                y_offset = (screen_h - new_h) // 2
+                
                 img = pygame.image.frombuffer(data, (w, h), "RGB")
-                img = pygame.transform.scale(img, screen.get_size())
-                screen.blit(img, (0, 0))
+                img = pygame.transform.scale(img, (new_w, new_h))
+                
+                # Fill black background first (clear previous frame garbage if aspect changed)
+                screen.fill((0,0,0)) 
+                screen.blit(img, (x_offset, y_offset))
             else:
                 # No signal yet or lost
                 screen.fill((20, 20, 20))
                 txt = font.render(f"Prêt. Attente flux...", True, (100, 100, 100))
                 screen.blit(txt, (50, 50))
-
-
 
             pygame.display.flip()
             

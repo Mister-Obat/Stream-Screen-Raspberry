@@ -6,3 +6,4 @@ customtkinter
 paramiko
 pillow
 av
+psutil

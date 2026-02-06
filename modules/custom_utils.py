@@ -4,6 +4,10 @@ import mss
 import dxcam
 import cv2
 import numpy as np
+import psutil
+import subprocess
+import threading
+import time
 from ctypes import windll, Structure, c_long, c_uint, c_void_p, byref
 
 # --- LOGGING GUI HANDLER (BATCHED) ---
@@ -181,3 +185,34 @@ def draw_cursor_arrow(img, x, y, scale=1.0):
     pts = pts.reshape((-1, 1, 2))
     cv2.fillPoly(img, [pts], (255, 255, 255))
     cv2.polylines(img, [pts], True, (0, 0, 0), max(1, int(1 * scale)))
+
+# --- SYSTEM METRICS (CPU/GPU) ---
+
+def get_cpu_usage():
+    """Returns CPU usage as a percentage (float)."""
+    try:
+        # interval=0.5 blocks for 0.5s but gives a precise reading over that window.
+        # Since this is called in a background thread in GUI, it is safe.
+        return psutil.cpu_percent(interval=0.5)
+    except:
+        return 0.0
+
+def get_gpu_usage():
+    """Returns NVIDIA GPU usage as a percentage (int) or 0 if failed."""
+    try:
+        # Run nvidia-smi
+        # Output format: "45\n"
+        cmd = ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"]
+        
+        # Prevent console window flashing on Windows
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, startupinfo=startupinfo, timeout=0.5)
+        if result.returncode == 0:
+            val = result.stdout.strip()
+            if val.isdigit():
+                return int(val)
+    except:
+        pass
+    return 0

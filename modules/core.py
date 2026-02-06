@@ -202,6 +202,9 @@ def stream_thread_func():
             encoder = VideoEncoder(enc_w, enc_h, state.fps, bitrate_bps, codec_choice=state.codec_choice, preset_choice=state.encoder_preset, initial_pts=initial_pts)
             state.encoder = encoder # Expose for RTSP (extradata)
             
+            # [DEBUG] Confirm actual codec (did we fallback?)
+            logger.info(f"[ENCODER STATUS] Active Codec: {encoder.codec_name}")
+            
             # Init Capture
             if current_backend == "DXCam":
                 try:

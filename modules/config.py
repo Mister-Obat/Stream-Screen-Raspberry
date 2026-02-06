@@ -81,6 +81,11 @@ class StreamState:
         self.remember_user = True
         self.remember_pass = True
         self.remember_path = True
+        # Remember Flags
+        self.remember_ip = True
+        self.remember_user = True
+        self.remember_pass = True
+        self.remember_path = True
         
         # Runtime Stats
         self.current_mbps = 0.0
@@ -114,6 +119,7 @@ class StreamState:
             # Save flags
             "remember_ip": self.remember_ip,
             "remember_user": self.remember_user,
+            "remember_pass": self.remember_pass,
             "remember_pass": self.remember_pass,
             "remember_path": self.remember_path,
             
